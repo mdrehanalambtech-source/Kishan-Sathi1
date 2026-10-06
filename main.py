@@ -74,6 +74,7 @@ app.add_middleware(
 
 GROQ_KEY = os.getenv("GROQ_API_KEY", "")
 TAVILY_KEY = os.getenv("TAVILY_API_KEY", "")
+OPENWEATHER_KEY = os.getenv("OPENWEATHER_API_KEY", "")
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 TAVILY_URL = "https://api.tavily.com/search"
