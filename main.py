@@ -436,6 +436,8 @@ import xml.etree.ElementTree as _ET
 _NEWS_CACHE = {"ts": 0, "data": None}
 _NEWS_TTL = 1800   # 30 minutes
 
+_WEATHER_CACHE = {}
+_WEATHER_TTL = 30 * 60
 
 @app.get("/news")
 async def news():
