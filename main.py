@@ -13,7 +13,7 @@ from knowledge import SCHEMES, IPM_RULES
 
 load_dotenv()
 
-app = FastAPI(title="Kishan Sathi API")
+app = FastAPI(title="Kisan Sathi API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -165,7 +165,7 @@ def code_to_hi(code: int) -> str:
 # ============================================================
 def build_system_prompt(context: str, target_lang: str = "Hindi") -> str:
     return (
-        "You are Kishan Sathi, a voice assistant for Indian farmers. "
+        "You are Kisan Sathi, a voice assistant for Indian farmers. "
         "You are speaking out loud to a farmer who may not read. "
         "Your reply will be read by Android Text-to-Speech.\n\n"
         "HARD RULES:\n"
@@ -517,7 +517,7 @@ async def geocode(lat: float, lon: float):
             f"https://nominatim.openstreetmap.org/reverse?format=json"
             f"&lat={lat}&lon={lon}&accept-language=en&zoom=10"
         )
-        async with httpx.AsyncClient(timeout=8, headers={"User-Agent": "KishanSathi/1.0"}) as c:
+        async with httpx.AsyncClient(timeout=8, headers={"User-Agent": "KisanSathi/1.0"}) as c:
             j = (await c.get(url)).json()
         a = j.get("address", {})
         st = a.get("state")
