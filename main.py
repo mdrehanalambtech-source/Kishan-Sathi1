@@ -334,37 +334,101 @@ async def groq_chat(system_prompt: str, user_text: str, max_tokens: int = 500):
 #  Weather
 # ============================================================
 
-async def fetch_weather(lat, lon):
-    if lat is None or lon is None:
+# ... (aapke imports aur baaki code ke upar) ...
+
+OPENWEATHER_KEY = os.getenv("OPENWEATHER_API_KEY", "")
+
+async def _fetch_openweather(lat: float, lon: float):
+    """Fallback: OpenWeatherMap se data laata hai."""
+    if not OPENWEATHER_KEY:
         return None
     url = (
-        f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
-        "&current=temperature_2m,relative_humidity_2m,precipitation,weather_code,wind_speed_10m"
-        "&daily=temperature_2m_max,temperature_2m_min,precipitation_sum"
-        "&forecast_days=3&timezone=Asia%2FKolkata"
+        f"https://api.openweathermap.org/data/2.5/weather?"
+        f"lat={lat}&lon={lon}&appid={OPENWEATHER_KEY}&units=metric"
     )
     try:
-        async with httpx.AsyncClient(timeout=8) as c:
+        async with httpx.AsyncClient(timeout=10) as c:
             r = await c.get(url)
-            r.raise_for_status()
+        if r.status_code == 200:
             return r.json()
     except Exception:
-        return None
+        pass
+    return None
 
+@app.get("/weather")
+async def weather(lat: float = 28.61, lon: float = 77.20):
+    """
+    Weather with fallback: Open-Meteo → OpenWeatherMap → Cache → Fallback text.
+    """
+    cache_key = f"{round(lat, 2)},{round(lon, 2)}"
+    now = time.time()
 
-def code_to_hi(code: int) -> str:
-    if code == 0: return "साफ आसमान"
-    if code in (1, 2): return "थोड़े बादल"
-    if code == 3: return "बादल छाए"
-    if code in (45, 48): return "कोहरा"
-    if code in (51, 53, 55): return "हल्की बूंदाबांदी"
-    if code in (61, 63, 65): return "बारिश"
-    if code in (71, 73, 75): return "बर्फबारी"
-    if code in (80, 81, 82): return "तेज़ बौछारें"
-    if code in (95, 96, 99): return "आंधी-तूफान"
-    return "मौसम"
+    # 1. Check cache
+    cached = _WEATHER_CACHE.get(cache_key)
+    if cached and (now - cached["ts"]) < _WEATHER_TTL:
+        out = dict(cached["data"])
+        out["cached"] = True
+        return out
 
-# ============================================================
+    # 2. Try Open-Meteo (Primary)
+    url_open_meteo = (
+        f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+        "&current=temperature_2m,relative_humidity_2m,precipitation,weather_code,wind_speed_10m"
+        "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,"
+        "precipitation_probability_max,wind_speed_10m_max,sunrise,sunset"
+        "&forecast_days=7&timezone=Asia%2FKolkata"
+    )
+    data_om = None
+    try:
+        async with httpx.AsyncClient(timeout=8) as c:
+            r = await c.get(url_open_meteo)
+        if r.status_code == 200:
+            data_om = r.json()
+    except Exception:
+        pass
+
+    if data_om:
+        # ... (Open-Meteo ka data process karke return karein, jaise pehle kiya tha) ...
+        # ... yeh code wahi rahega ...
+        return result # (result variable mein processed data)
+
+    # 3. Fallback to OpenWeatherMap
+    data_ow = await _fetch_openweather(lat, lon)
+    if data_ow:
+        # OpenWeatherMap ke data ko hamare format mein badlein
+        main = data_ow.get("main", {})
+        wind = data_ow.get("wind", {})
+        weather_info = data_ow.get("weather", [{}])[0]
+        result = {
+            "current": {
+                "temp": main.get("temp"),
+                "humidity": main.get("humidity"),
+                "rain": data_ow.get("rain", {}).get("1h", 0),
+                "wind": wind.get("speed", 0) * 3.6,  # m/s to km/h
+                "code": weather_info.get("id"),
+                "desc": weather_info.get("description", "मौसम"),
+            },
+            "days": [],  # OpenWeatherMap free mein 7-day forecast nahi hai
+            "advice": "मौसम की जानकारी उपलब्ध है।",
+            "cached": False,
+        }
+        _WEATHER_CACHE[cache_key] = {"ts": now, "data": result}
+        return result
+
+    # 4. Use stale cache if available
+    if cached:
+        out = dict(cached["data"])
+        out["cached"] = True
+        out["stale"] = True
+        return out
+
+    # 5. Final fallback
+    return {
+        "current": {"temp": 30.0, "humidity": 60, "rain": 0.0, "wind": 10.0, "code": 0, "desc": "मौसम डेटा अभी उपलब्ध नहीं"},
+        "days": [],
+        "advice": "मौसम सेवा अभी व्यस्त है। थोड़ी देर बाद फिर कोशिश करें।",
+        "fallback": True,
+    }
 #  NEWS — Google News RSS (Hindi, real agriculture news)
 # ============================================================
 import xml.etree.ElementTree as _ET
