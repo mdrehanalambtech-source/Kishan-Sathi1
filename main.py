@@ -336,10 +336,12 @@ async def groq_chat(system_prompt: str, user_text: str, max_tokens: int = 500):
 
 # ... (aapke imports aur baaki code ke upar) ...
 
-OPENWEATHER_KEY = os.getenv("OPENWEATHER_API_KEY", "")
+_WEATHER_CACHE = {}
+_WEATHER_TTL = 30 * 60
 
-async def _fetch_openweather(lat: float, lon: float):
-    """Fallback: OpenWeatherMap se data laata hai."""
+
+async def _fetch_openweather_current(lat: float, lon: float):
+    """OpenWeatherMap — current weather."""
     if not OPENWEATHER_KEY:
         return None
     url = (
@@ -355,23 +357,57 @@ async def _fetch_openweather(lat: float, lon: float):
         pass
     return None
 
+
+async def _fetch_openweather_forecast(lat: float, lon: float):
+    """OpenWeatherMap — 5-day/3-hour forecast (free tier)."""
+    if not OPENWEATHER_KEY:
+        return None
+    url = (
+        f"https://api.openweathermap.org/data/2.5/forecast?"
+        f"lat={lat}&lon={lon}&appid={OPENWEATHER_KEY}&units=metric"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(url)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+
+def _owm_to_code(owm_id: int) -> int:
+    """Map OpenWeatherMap condition id to Open-Meteo weather code."""
+    if 200 <= owm_id < 300: return 95
+    if 300 <= owm_id < 400: return 51
+    if 500 <= owm_id < 600: return 61
+    if 600 <= owm_id < 700: return 71
+    if 700 <= owm_id < 800: return 45
+    if owm_id == 800: return 0
+    if owm_id == 801: return 1
+    if owm_id == 802: return 2
+    if owm_id >= 803: return 3
+    return 0
+
+
 @app.get("/weather")
 async def weather(lat: float = 28.61, lon: float = 77.20):
     """
-    Weather with fallback: Open-Meteo → OpenWeatherMap → Cache → Fallback text.
+    Weather with 30-min cache and multi-source fallback:
+    Open-Meteo (7 days) → OpenWeatherMap (5 days) → cache → fallback
     """
     cache_key = f"{round(lat, 2)},{round(lon, 2)}"
     now = time.time()
 
-    # 1. Check cache
+    # 1. Cache hit
     cached = _WEATHER_CACHE.get(cache_key)
     if cached and (now - cached["ts"]) < _WEATHER_TTL:
         out = dict(cached["data"])
         out["cached"] = True
         return out
 
-    # 2. Try Open-Meteo (Primary)
-    url_open_meteo = (
+    # 2. Try Open-Meteo (7-day, best quality)
+    url_om = (
         f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
         "&current=temperature_2m,relative_humidity_2m,precipitation,weather_code,wind_speed_10m"
         "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,"
@@ -379,43 +415,140 @@ async def weather(lat: float = 28.61, lon: float = 77.20):
         "&forecast_days=7&timezone=Asia%2FKolkata"
     )
     data_om = None
-    try:
-        async with httpx.AsyncClient(timeout=8) as c:
-            r = await c.get(url_open_meteo)
-        if r.status_code == 200:
-            data_om = r.json()
-    except Exception:
-        pass
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=8) as c:
+                r = await c.get(url_om)
+            if r.status_code == 200:
+                data_om = r.json()
+                break
+        except Exception:
+            if attempt == 0:
+                await asyncio.sleep(0.6)
 
     if data_om:
-        # ... (Open-Meteo ka data process karke return karein, jaise pehle kiya tha) ...
-        # ... yeh code wahi rahega ...
-        return result # (result variable mein processed data)
+        cur = data_om.get("current", {})
+        daily = data_om.get("daily", {})
+        days = []
+        for i in range(len(daily.get("time", []))):
+            days.append({
+                "date": daily["time"][i],
+                "code": daily["weather_code"][i],
+                "desc": code_to_hi(daily["weather_code"][i]),
+                "tmax": daily["temperature_2m_max"][i],
+                "tmin": daily["temperature_2m_min"][i],
+                "rain_mm": daily["precipitation_sum"][i],
+                "rain_pct": daily["precipitation_probability_max"][i],
+                "wind_kmh": daily["wind_speed_10m_max"][i],
+                "sunrise": daily["sunrise"][i][-5:],
+                "sunset": daily["sunset"][i][-5:],
+            })
+        rain24 = days[0]["rain_mm"] if days else 0
+        tmax_today = days[0]["tmax"] if days else 0
+        if rain24 > 10:
+            advice = "आज तेज़ बारिश की संभावना। खेत में पानी निकासी का इंतज़ाम करें।"
+        elif rain24 > 2:
+            advice = "हल्की बारिश संभव। सिंचाई टाल दें।"
+        elif tmax_today > 38:
+            advice = "तेज़ गर्मी। सुबह या शाम को सिंचाई करें।"
+        elif tmax_today < 15:
+            advice = "ठंड ज़्यादा है। रात में हल्की सिंचाई करें।"
+        else:
+            advice = "मौसम ठीक है। सामान्य काम कर सकते हैं।"
 
-    # 3. Fallback to OpenWeatherMap
-    data_ow = await _fetch_openweather(lat, lon)
-    if data_ow:
-        # OpenWeatherMap ke data ko hamare format mein badlein
-        main = data_ow.get("main", {})
-        wind = data_ow.get("wind", {})
-        weather_info = data_ow.get("weather", [{}])[0]
         result = {
             "current": {
-                "temp": main.get("temp"),
-                "humidity": main.get("humidity"),
-                "rain": data_ow.get("rain", {}).get("1h", 0),
-                "wind": wind.get("speed", 0) * 3.6,  # m/s to km/h
-                "code": weather_info.get("id"),
-                "desc": weather_info.get("description", "मौसम"),
+                "temp": cur.get("temperature_2m"),
+                "humidity": cur.get("relative_humidity_2m"),
+                "rain": cur.get("precipitation"),
+                "wind": cur.get("wind_speed_10m"),
+                "code": cur.get("weather_code"),
+                "desc": code_to_hi(cur.get("weather_code", 0)),
             },
-            "days": [],  # OpenWeatherMap free mein 7-day forecast nahi hai
-            "advice": "मौसम की जानकारी उपलब्ध है।",
+            "days": days,
+            "advice": advice,
             "cached": False,
+            "source": "open-meteo",
         }
         _WEATHER_CACHE[cache_key] = {"ts": now, "data": result}
         return result
 
-    # 4. Use stale cache if available
+    # 3. Fallback: OpenWeatherMap (current + 5-day forecast)
+    data_ow = await _fetch_openweather_current(lat, lon)
+    if data_ow:
+        main_d = data_ow.get("main", {})
+        wind = data_ow.get("wind", {})
+        w = data_ow.get("weather", [{}])[0]
+
+        # Get forecast for days
+        days = []
+        fc = await _fetch_openweather_forecast(lat, lon)
+        if fc and "list" in fc:
+            # Group 3-hour chunks by date (India timezone)
+            from collections import OrderedDict
+            by_date = OrderedDict()
+            for item in fc["list"]:
+                dt_txt = item.get("dt_txt", "")   # "2025-10-08 12:00:00"
+                date_str = dt_txt.split(" ")[0]
+                if date_str not in by_date:
+                    by_date[date_str] = {
+                        "tmax": item["main"].get("temp_max", 0),
+                        "tmin": item["main"].get("temp_min", 0),
+                        "rain_mm": 0.0,
+                        "rain_pct": 0,
+                        "wind_kmh": 0.0,
+                        "codes": [],
+                    }
+                d = by_date[date_str]
+                d["tmax"] = max(d["tmax"], item["main"].get("temp_max", 0))
+                d["tmin"] = min(d["tmin"], item["main"].get("temp_min", 0))
+                d["rain_mm"] += item.get("rain", {}).get("3h", 0.0)
+                d["rain_pct"] = max(d["rain_pct"], int(item.get("pop", 0) * 100))
+                d["wind_kmh"] = max(d["wind_kmh"], wind.get("speed", 0) * 3.6)
+                if item.get("weather"):
+                    d["codes"].append(item["weather"][0].get("id", 800))
+
+            for date_str, d in list(by_date.items())[:7]:
+                code = _owm_to_code(d["codes"][0] if d["codes"] else 800)
+                days.append({
+                    "date": date_str,
+                    "code": code,
+                    "desc": code_to_hi(code),
+                    "tmax": round(d["tmax"], 1),
+                    "tmin": round(d["tmin"], 1),
+                    "rain_mm": round(d["rain_mm"], 1),
+                    "rain_pct": d["rain_pct"],
+                    "wind_kmh": round(d["wind_kmh"], 1),
+                    "sunrise": "",
+                    "sunset": "",
+                })
+
+        advice = "मौसम की जानकारी उपलब्ध है।"
+        if days:
+            rain24 = days[0]["rain_mm"]
+            if rain24 > 10:
+                advice = "आज तेज़ बारिश की संभावना। खेत में पानी निकासी का इंतज़ाम करें।"
+            elif rain24 > 2:
+                advice = "हल्की बारिश संभव। सिंचाई टाल दें।"
+
+        result = {
+            "current": {
+                "temp": main_d.get("temp"),
+                "humidity": main_d.get("humidity"),
+                "rain": data_ow.get("rain", {}).get("1h", 0),
+                "wind": round(wind.get("speed", 0) * 3.6, 1),
+                "code": _owm_to_code(w.get("id", 800)),
+                "desc": code_to_hi(_owm_to_code(w.get("id", 800))),
+            },
+            "days": days,
+            "advice": advice,
+            "cached": False,
+            "source": "openweathermap",
+        }
+        _WEATHER_CACHE[cache_key] = {"ts": now, "data": result}
+        return result
+
+    # 4. Stale cache
     if cached:
         out = dict(cached["data"])
         out["cached"] = True
@@ -424,9 +557,12 @@ async def weather(lat: float = 28.61, lon: float = 77.20):
 
     # 5. Final fallback
     return {
-        "current": {"temp": 30.0, "humidity": 60, "rain": 0.0, "wind": 10.0, "code": 0, "desc": "मौसम डेटा अभी उपलब्ध नहीं"},
+        "current": {
+            "temp": 30.0, "humidity": 60, "rain": 0.0,
+            "wind": 10.0, "code": 0, "desc": "मौसम डेटा उपलब्ध नहीं",
+        },
         "days": [],
-        "advice": "मौसम सेवा अभी व्यस्त है। थोड़ी देर बाद फिर कोशिश करें।",
+        "advice": "मौसम सेवा अभी व्यस्त है। थोड़ी देर बाद कोशिश करें।",
         "fallback": True,
     }
 #  NEWS — Google News RSS (Hindi, real agriculture news)
