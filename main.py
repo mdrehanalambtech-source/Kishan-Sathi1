@@ -280,160 +280,189 @@ async def health():
     }
 
 
-# ---------- WEATHER ----------
+# ============================================================
+#  WEATHER — Open-Meteo primary, wttr.in fallback
+# ============================================================
+_WEATHER_CACHE = {}
+_WEATHER_TTL = 6 * 3600   # 6 hours
+
+
+async def _fetch_wttr_in(lat: float, lon: float):
+    """wttr.in fallback — no key, no rate limit, 3-day forecast."""
+    url = f"https://wttr.in/{lat},{lon}?format=j1"
+    try:
+        async with httpx.AsyncClient(
+            timeout=12,
+            headers={"User-Agent": "curl/7.68.0"}
+        ) as c:
+            r = await c.get(url)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+
+def _wttr_code_to_om(desc: str) -> int:
+    """Roughly map wttr.in text to Open-Meteo weather code."""
+    d = desc.lower()
+    if "sun" in d or "clear" in d: return 0
+    if "partly" in d: return 2
+    if "cloud" in d or "overcast" in d: return 3
+    if "fog" in d or "mist" in d: return 45
+    if "drizzle" in d or "light rain" in d: return 51
+    if "rain" in d or "shower" in d: return 61
+    if "snow" in d or "sleet" in d: return 71
+    if "thunder" in d or "storm" in d: return 95
+    return 0
+
+
 @app.get("/weather")
 async def weather(lat: float = 28.61, lon: float = 77.20):
     cache_key = f"{round(lat, 2)},{round(lon, 2)}"
     now = time.time()
 
+    # 1. Cache hit
     cached = _WEATHER_CACHE.get(cache_key)
     if cached and (now - cached["ts"]) < _WEATHER_TTL:
         out = dict(cached["data"])
         out["cached"] = True
         return out
 
-    url = (
+    # 2. Try Open-Meteo (7-day, best quality)
+    url_om = (
         f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
         "&current=temperature_2m,relative_humidity_2m,precipitation,weather_code,wind_speed_10m"
         "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,"
         "precipitation_probability_max,wind_speed_10m_max,sunrise,sunset"
         "&forecast_days=7&timezone=Asia%2FKolkata"
     )
-
-    data = None
-    for attempt in range(2):
+    data_om = None
+    for attempt in range(3):
         try:
             async with httpx.AsyncClient(timeout=10) as c:
-                r = await c.get(url)
+                r = await c.get(url_om)
             if r.status_code == 200:
-                data = r.json()
+                data_om = r.json()
                 break
         except Exception:
-            if attempt == 0:
-                await asyncio.sleep(0.6)
-            continue
+            if attempt < 2:
+                await asyncio.sleep(1.0 * (attempt + 1))
 
-    if data is None:
-        if cached:
-            out = dict(cached["data"])
-            out["cached"] = True
-            out["stale"] = True
-            return out
-        return {
+    if data_om:
+        cur = data_om.get("current", {})
+        daily = data_om.get("daily", {})
+        days = []
+        for i in range(len(daily.get("time", []))):
+            days.append({
+                "date": daily["time"][i],
+                "code": daily["weather_code"][i],
+                "desc": code_to_hi(daily["weather_code"][i]),
+                "tmax": daily["temperature_2m_max"][i],
+                "tmin": daily["temperature_2m_min"][i],
+                "rain_mm": daily["precipitation_sum"][i],
+                "rain_pct": daily["precipitation_probability_max"][i],
+                "wind_kmh": daily["wind_speed_10m_max"][i],
+                "sunrise": daily["sunrise"][i][-5:],
+                "sunset": daily["sunset"][i][-5:],
+            })
+        advice = _weather_advice(days)
+        result = {
             "current": {
-                "temp": 30.0, "humidity": 60, "rain": 0.0,
-                "wind": 10.0, "code": 0,
-                "desc": "मौसम डेटा अभी उपलब्ध नहीं",
+                "temp": cur.get("temperature_2m"),
+                "humidity": cur.get("relative_humidity_2m"),
+                "rain": cur.get("precipitation"),
+                "wind": cur.get("wind_speed_10m"),
+                "code": cur.get("weather_code"),
+                "desc": code_to_hi(cur.get("weather_code", 0)),
             },
-            "days": [],
-            "advice": "मौसम सेवा अभी व्यस्त है। थोड़ी देर बाद कोशिश करें।",
-            "fallback": True,
+            "days": days,
+            "advice": advice,
+            "cached": False,
+            "source": "open-meteo",
         }
+        _WEATHER_CACHE[cache_key] = {"ts": now, "data": result}
+        return result
 
-    cur = data.get("current", {})
-    daily = data.get("daily", {})
+    # 3. Fallback: wttr.in (3-day forecast)
+    data_wt = await _fetch_wttr_in(lat, lon)
+    if data_wt:
+        cc = data_wt.get("current_condition", [{}])[0]
+        desc = cc.get("weatherDesc", [{}])[0].get("value", "मौसम")
+        code = _wttr_code_to_om(desc)
 
-    days = []
-    for i in range(len(daily.get("time", []))):
-        days.append({
-            "date": daily["time"][i],
-            "code": daily["weather_code"][i],
-            "desc": code_to_hi(daily["weather_code"][i]),
-            "tmax": daily["temperature_2m_max"][i],
-            "tmin": daily["temperature_2m_min"][i],
-            "rain_mm": daily["precipitation_sum"][i],
-            "rain_pct": daily["precipitation_probability_max"][i],
-            "wind_kmh": daily["wind_speed_10m_max"][i],
-            "sunrise": daily["sunrise"][i][-5:],
-            "sunset": daily["sunset"][i][-5:],
-        })
+        days = []
+        for d in data_wt.get("weather", [])[:5]:
+            hourly = d.get("hourly", [{}])
+            midday = hourly[4] if len(hourly) > 4 else hourly[0] if hourly else {}
+            hdesc = midday.get("weatherDesc", [{}])[0].get("value", "मौसम")
+            hcode = _wttr_code_to_om(hdesc)
+            days.append({
+                "date": d.get("date", ""),
+                "code": hcode,
+                "desc": code_to_hi(hcode),
+                "tmax": float(d.get("maxtempC", 0)),
+                "tmin": float(d.get("mintempC", 0)),
+                "rain_mm": float(midday.get("precipMM", 0) or 0),
+                "rain_pct": int(midday.get("chanceofrain", 0) or 0),
+                "wind_kmh": float(midday.get("windspeedKmph", 0) or 0),
+                "sunrise": d.get("astronomy", [{}])[0].get("sunrise", ""),
+                "sunset": d.get("astronomy", [{}])[0].get("sunset", ""),
+            })
 
-    advice = ""
-    rain24 = days[0]["rain_mm"] if days else 0
-    tmax_today = days[0]["tmax"] if days else 0
-    if rain24 > 10:
-        advice = "आज तेज़ बारिश की संभावना। खेत में पानी निकासी का इंतज़ाम करें।"
-    elif rain24 > 2:
-        advice = "हल्की बारिश संभव। सिंचाई टाल दें।"
-    elif tmax_today > 38:
-        advice = "तेज़ गर्मी। सुबह या शाम को सिंचाई करें।"
-    elif tmax_today < 15:
-        advice = "ठंड ज़्यादा है। रात में हल्की सिंचाई करें।"
-    else:
-        advice = "मौसम ठीक है। सामान्य काम कर सकते हैं।"
+        advice = _weather_advice(days)
+        result = {
+            "current": {
+                "temp": float(cc.get("temp_C", 30)),
+                "humidity": float(cc.get("humidity", 60)),
+                "rain": float(cc.get("precipMM", 0) or 0),
+                "wind": float(cc.get("windspeedKmph", 10) or 10),
+                "code": code,
+                "desc": code_to_hi(code),
+            },
+            "days": days,
+            "advice": advice,
+            "cached": False,
+            "source": "wttr.in",
+        }
+        _WEATHER_CACHE[cache_key] = {"ts": now, "data": result}
+        return result
 
-    result = {
+    # 4. Stale cache if available
+    if cached:
+        out = dict(cached["data"])
+        out["cached"] = True
+        out["stale"] = True
+        return out
+
+    # 5. Final fallback (no data at all)
+    return {
         "current": {
-            "temp": cur.get("temperature_2m"),
-            "humidity": cur.get("relative_humidity_2m"),
-            "rain": cur.get("precipitation"),
-            "wind": cur.get("wind_speed_10m"),
-            "code": cur.get("weather_code"),
-            "desc": code_to_hi(cur.get("weather_code", 0)),
+            "temp": 30.0, "humidity": 60, "rain": 0.0,
+            "wind": 10.0, "code": 0, "desc": "मौसम डेटा उपलब्ध नहीं",
         },
-        "days": days,
-        "advice": advice,
-        "cached": False,
+        "days": [],
+        "advice": "मौसम सेवा अभी व्यस्त है। थोड़ी देर बाद कोशिश करें।",
+        "fallback": True,
     }
-    _WEATHER_CACHE[cache_key] = {"ts": now, "data": result}
-    return result
 
 
-# ---------- CHAT ----------
-@app.post("/chat")
-async def chat(body: ChatIn):
-    weather_ctx = None
-    bits = []
-    if body.lat and body.lon:
-        try:
-            weather_ctx = await weather(lat=body.lat, lon=body.lon)
-            c = weather_ctx.get("current", {})
-            bits.append(
-                f"Weather: {c.get('temp')}C, humidity {c.get('humidity')}%, "
-                f"rain {c.get('rain')}mm, wind {c.get('wind')} km/h, {c.get('desc')}."
-            )
-        except Exception:
-            pass
-    if body.district and body.state:
-        bits.append(f"District: {body.district}, {body.state}.")
-    context = "\n".join(bits) if bits else "(no live data)"
-
-    lang_name = LANG_NAMES.get(body.lang.split("-")[0].lower(), "Hindi")
-    reply = await groq_chat(
-        build_system_prompt(context, lang_name),
-        body.question,
-        max_tokens=500,
-    )
-    return {"reply": reply, "weather": weather_ctx, "lang_detected": body.lang}
-
-
-# ---------- STORAGE ADVICE ----------
-@app.post("/storage-advice")
-async def storage_advice(body: StorageQ):
-    lang_name = LANG_NAMES.get(body.lang.split("-")[0].lower(), "Hindi")
-    price_line = (
-        f"Farmer's reported current price for {body.crop} is ₹{body.current_price}/quintal. "
-        if body.current_price else
-        f"No price reported for {body.crop}. "
-    )
-    location_line = f"Location: {body.district}. " if body.district else ""
-
-    system = (
-        f"You are an agricultural market advisor for Indian farmers. Reply ONLY in {lang_name}.\n\n"
-        "Give ONE clear recommendation — SELL NOW, or HOLD for X weeks. Then 2-3 short reasons.\n"
-        "Rules:\n"
-        "- Never invent a specific price.\n"
-        "- Consider harvest season, storage lifespan, perishability, MSP timing.\n"
-        "- Perishables (tomato, onion, leafy greens): usually SELL NOW.\n"
-        "- Grains (wheat, rice, maize, pulses): HOLD if peak harvest, SELL if off-season.\n"
-        "- Write for spoken delivery: 3-5 short sentences. No lists, no emojis.\n"
-        "- End with one short sentence that says this is AI advice — verify at the mandi.\n"
-    )
-    user = f"{price_line}{location_line}Should I sell {body.crop} now or hold?"
-    reply = await groq_chat(system, user, max_tokens=400)
-    return {"reply": reply}
-
-
+def _weather_advice(days):
+    if not days:
+        return "मौसम ठीक है। सामान्य काम कर सकते हैं।"
+    rain24 = days[0].get("rain_mm", 0) or 0
+    tmax_today = days[0].get("tmax", 0) or 0
+    if rain24 > 10:
+        return "आज तेज़ बारिश की संभावना। खेत में पानी निकासी का इंतज़ाम करें।"
+    elif rain24 > 2:
+        return "हल्की बारिश संभव। सिंचाई टाल दें।"
+    elif tmax_today > 38:
+        return "तेज़ गर्मी। सुबह या शाम को सिंचाई करें।"
+    elif tmax_today < 15:
+        return "ठंड ज़्यादा है। रात में हल्की सिंचाई करें।"
+    else:
+        return "मौसम ठीक है। सामान्य काम कर सकते हैं।"
+    
 # ---------- DISEASE ----------
 @app.post("/disease")
 async def disease(image: UploadFile = File(...), lang: str = Form("hi")):
