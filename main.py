@@ -107,7 +107,7 @@ _NEWS_CACHE = {"ts": 0, "data": None}
 _NEWS_TTL = 3600
 
 _WEATHER_CACHE = {}
-_WEATHER_TTL = 60 * 60  # 1 hour
+_WEATHER_TTL = 6 * 3600
 
 _KNOWLEDGE_CACHE = {"ts": 0, "tips": None}
 _KNOWLEDGE_TTL = 2 * 3600
@@ -160,6 +160,22 @@ def code_to_hi(code: int) -> str:
     return "मौसम"
 
 
+def _weather_advice(days):
+    if not days:
+        return "मौसम ठीक है। सामान्य काम कर सकते हैं।"
+    rain24 = days[0].get("rain_mm", 0) or 0
+    tmax_today = days[0].get("tmax", 0) or 0
+    if rain24 > 10:
+        return "आज तेज़ बारिश की संभावना। खेत में पानी निकासी का इंतज़ाम करें।"
+    elif rain24 > 2:
+        return "हल्की बारिश संभव। सिंचाई टाल दें।"
+    elif tmax_today > 38:
+        return "तेज़ गर्मी। सुबह या शाम को सिंचाई करें।"
+    elif tmax_today < 15:
+        return "ठंड ज़्यादा है। रात में हल्की सिंचाई करें।"
+    return "मौसम ठीक है। सामान्य काम कर सकते हैं।"
+
+
 # ============================================================
 #  SYSTEM PROMPT
 # ============================================================
@@ -186,7 +202,7 @@ def build_system_prompt(context: str, target_lang: str = "Hindi") -> str:
 
 
 # ============================================================
-#  GROQ CHAT
+#  GROQ
 # ============================================================
 async def groq_chat(system_prompt: str, user_text: str, max_tokens: int = 500):
     if not GROQ_KEY:
@@ -268,7 +284,7 @@ class TTSIn(BaseModel):
 
 
 # ============================================================
-#  ENDPOINTS
+#  HEALTH
 # ============================================================
 @app.get("/health")
 async def health():
@@ -283,17 +299,11 @@ async def health():
 # ============================================================
 #  WEATHER — Open-Meteo primary, wttr.in fallback
 # ============================================================
-_WEATHER_CACHE = {}
-_WEATHER_TTL = 6 * 3600   # 6 hours
-
-
 async def _fetch_wttr_in(lat: float, lon: float):
-    """wttr.in fallback — no key, no rate limit, 3-day forecast."""
     url = f"https://wttr.in/{lat},{lon}?format=j1"
     try:
         async with httpx.AsyncClient(
-            timeout=12,
-            headers={"User-Agent": "curl/7.68.0"}
+            timeout=12, headers={"User-Agent": "curl/7.68.0"}
         ) as c:
             r = await c.get(url)
         if r.status_code == 200:
@@ -304,7 +314,6 @@ async def _fetch_wttr_in(lat: float, lon: float):
 
 
 def _wttr_code_to_om(desc: str) -> int:
-    """Roughly map wttr.in text to Open-Meteo weather code."""
     d = desc.lower()
     if "sun" in d or "clear" in d: return 0
     if "partly" in d: return 2
@@ -322,14 +331,12 @@ async def weather(lat: float = 28.61, lon: float = 77.20):
     cache_key = f"{round(lat, 2)},{round(lon, 2)}"
     now = time.time()
 
-    # 1. Cache hit
     cached = _WEATHER_CACHE.get(cache_key)
     if cached and (now - cached["ts"]) < _WEATHER_TTL:
         out = dict(cached["data"])
         out["cached"] = True
         return out
 
-    # 2. Try Open-Meteo (7-day, best quality)
     url_om = (
         f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
         "&current=temperature_2m,relative_humidity_2m,precipitation,weather_code,wind_speed_10m"
@@ -366,7 +373,6 @@ async def weather(lat: float = 28.61, lon: float = 77.20):
                 "sunrise": daily["sunrise"][i][-5:],
                 "sunset": daily["sunset"][i][-5:],
             })
-        advice = _weather_advice(days)
         result = {
             "current": {
                 "temp": cur.get("temperature_2m"),
@@ -377,14 +383,13 @@ async def weather(lat: float = 28.61, lon: float = 77.20):
                 "desc": code_to_hi(cur.get("weather_code", 0)),
             },
             "days": days,
-            "advice": advice,
+            "advice": _weather_advice(days),
             "cached": False,
             "source": "open-meteo",
         }
         _WEATHER_CACHE[cache_key] = {"ts": now, "data": result}
         return result
 
-    # 3. Fallback: wttr.in (3-day forecast)
     data_wt = await _fetch_wttr_in(lat, lon)
     if data_wt:
         cc = data_wt.get("current_condition", [{}])[0]
@@ -394,7 +399,7 @@ async def weather(lat: float = 28.61, lon: float = 77.20):
         days = []
         for d in data_wt.get("weather", [])[:5]:
             hourly = d.get("hourly", [{}])
-            midday = hourly[4] if len(hourly) > 4 else hourly[0] if hourly else {}
+            midday = hourly[4] if len(hourly) > 4 else (hourly[0] if hourly else {})
             hdesc = midday.get("weatherDesc", [{}])[0].get("value", "मौसम")
             hcode = _wttr_code_to_om(hdesc)
             days.append({
@@ -410,7 +415,6 @@ async def weather(lat: float = 28.61, lon: float = 77.20):
                 "sunset": d.get("astronomy", [{}])[0].get("sunset", ""),
             })
 
-        advice = _weather_advice(days)
         result = {
             "current": {
                 "temp": float(cc.get("temp_C", 30)),
@@ -421,21 +425,19 @@ async def weather(lat: float = 28.61, lon: float = 77.20):
                 "desc": code_to_hi(code),
             },
             "days": days,
-            "advice": advice,
+            "advice": _weather_advice(days),
             "cached": False,
             "source": "wttr.in",
         }
         _WEATHER_CACHE[cache_key] = {"ts": now, "data": result}
         return result
 
-    # 4. Stale cache if available
     if cached:
         out = dict(cached["data"])
         out["cached"] = True
         out["stale"] = True
         return out
 
-    # 5. Final fallback (no data at all)
     return {
         "current": {
             "temp": 30.0, "humidity": 60, "rain": 0.0,
@@ -447,23 +449,91 @@ async def weather(lat: float = 28.61, lon: float = 77.20):
     }
 
 
-def _weather_advice(days):
-    if not days:
-        return "मौसम ठीक है। सामान्य काम कर सकते हैं।"
-    rain24 = days[0].get("rain_mm", 0) or 0
-    tmax_today = days[0].get("tmax", 0) or 0
-    if rain24 > 10:
-        return "आज तेज़ बारिश की संभावना। खेत में पानी निकासी का इंतज़ाम करें।"
-    elif rain24 > 2:
-        return "हल्की बारिश संभव। सिंचाई टाल दें।"
-    elif tmax_today > 38:
-        return "तेज़ गर्मी। सुबह या शाम को सिंचाई करें।"
-    elif tmax_today < 15:
-        return "ठंड ज़्यादा है। रात में हल्की सिंचाई करें।"
-    else:
-        return "मौसम ठीक है। सामान्य काम कर सकते हैं।"
-    
-# ---------- DISEASE ----------
+# ============================================================
+#  CHAT
+# ============================================================
+@app.post("/chat")
+async def chat(body: ChatIn):
+    weather_ctx = None
+    bits = []
+    if body.lat and body.lon:
+        try:
+            weather_ctx = await weather(lat=body.lat, lon=body.lon)
+            c = weather_ctx.get("current", {})
+            bits.append(
+                f"Weather: {c.get('temp')}C, humidity {c.get('humidity')}%, "
+                f"rain {c.get('rain')}mm, wind {c.get('wind')} km/h, {c.get('desc')}."
+            )
+        except Exception:
+            pass
+    if body.district and body.state:
+        bits.append(f"District: {body.district}, {body.state}.")
+    context = "\n".join(bits) if bits else "(no live data)"
+
+    lang_name = LANG_NAMES.get(body.lang.split("-")[0].lower(), "Hindi")
+    reply = await groq_chat(
+        build_system_prompt(context, lang_name),
+        body.question,
+        max_tokens=500,
+    )
+    return {"reply": reply, "weather": weather_ctx, "lang_detected": body.lang}
+
+
+# ============================================================
+#  STORAGE ADVICE
+# ============================================================
+@app.post("/storage-advice")
+async def storage_advice(body: StorageQ):
+    lang_name = LANG_NAMES.get(body.lang.split("-")[0].lower(), "Hindi")
+    price_line = (
+        f"Farmer's reported price for {body.crop}: ₹{body.current_price}/quintal. "
+        if body.current_price else
+        f"No price reported for {body.crop}. "
+    )
+    location_line = f"Location: {body.district}. " if body.district else ""
+
+    system = (
+        f"You are an agricultural market advisor for Indian farmers. Reply ONLY in {lang_name}.\n\n"
+        "Give ONE clear recommendation — SELL NOW, or HOLD for X weeks. Then 2-3 short reasons.\n"
+        "Rules:\n"
+        "- Never invent a specific price.\n"
+        "- Consider harvest season, storage lifespan, perishability, MSP timing.\n"
+        "- Perishables (tomato, onion, leafy greens): usually SELL NOW.\n"
+        "- Grains (wheat, rice, maize, pulses): HOLD if peak harvest, SELL if off-season.\n"
+        "- Write for spoken delivery: 3-5 short sentences. No lists, no emojis.\n"
+        "- End with one short sentence that says this is AI advice — verify at the mandi.\n"
+    )
+    user = f"{price_line}{location_line}Should I sell {body.crop} now or hold?"
+
+    reply = ""
+    for attempt in range(2):
+        try:
+            reply = await groq_chat(system, user, max_tokens=400)
+            if reply and len(reply.strip()) > 20:
+                break
+        except Exception:
+            await asyncio.sleep(1.5)
+
+    if not reply or len(reply.strip()) < 20:
+        if body.crop.lower() in ["टमाटर", "tomato", "प्याज", "onion", "आलू", "potato"]:
+            reply = (
+                f"{body.crop} जल्दी खराब होने वाली फसल है। "
+                "अगर भाव ठीक मिल रहा है तो अभी बेच दें। "
+                "यह AI सलाह है — मंडी में भाव की पुष्टि करें।"
+            )
+        else:
+            reply = (
+                f"{body.crop} के लिए, अगर मंडी में भाव अच्छा नहीं मिल रहा, "
+                "तो 2-3 हफ़्ते रोक सकते हैं। बेचने से पहले नज़दीकी मंडी में भाव पता करें। "
+                "यह AI सलाह है — मंडी में भाव की पुष्टि करें।"
+            )
+
+    return {"reply": reply}
+
+
+# ============================================================
+#  DISEASE
+# ============================================================
 @app.post("/disease")
 async def disease(image: UploadFile = File(...), lang: str = Form("hi")):
     img_bytes = await image.read()
@@ -509,7 +579,9 @@ async def disease(image: UploadFile = File(...), lang: str = Form("hi")):
     return {"reply": text}
 
 
-# ---------- GEOCODE ----------
+# ============================================================
+#  GEOCODE
+# ============================================================
 @app.get("/geocode")
 async def geocode(lat: float, lon: float):
     try:
@@ -538,7 +610,9 @@ async def geocode(lat: float, lon: float):
     }
 
 
-# ---------- MANDI ----------
+# ============================================================
+#  MANDI
+# ============================================================
 def _sample_mandi(state: str, district: str):
     sample = [
         {"crop": "गेहूं", "variety": "सामान्य", "min": 2150, "max": 2450, "modal": 2320, "trend": "up", "change": 120},
@@ -685,7 +759,9 @@ async def mandi_list(
     return base
 
 
-# ---------- SCHEMES ----------
+# ============================================================
+#  SCHEMES
+# ============================================================
 SCHEMES_DB = [
     {
         "id": "pm-kisan", "name_hi": "प्रधानमंत्री किसान सम्मान निधि",
@@ -863,8 +939,9 @@ async def schemes_match(profile: ProfileIn):
         "schemes": results,
     }
 
-
-# ---------- KNOWLEDGE ----------
+# ============================================================
+#  KNOWLEDGE
+# ============================================================
 _FALLBACK_TIPS = [
     {"title": "सुबह की सिंचाई सबसे अच्छी",
      "detail": "सुबह 6-9 बजे सिंचाई करने से 30% पानी बचता है और फसल जल्दी बढ़ती है।"},
@@ -1007,7 +1084,9 @@ async def knowledge(force: bool = False):
     }
 
 
-# ---------- NEWS ----------
+# ============================================================
+#  NEWS
+# ============================================================
 import xml.etree.ElementTree as _ET
 
 
@@ -1074,7 +1153,9 @@ def _human_time(rfc822: str) -> str:
         return ""
 
 
-# ---------- STT / TTS ----------
+# ============================================================
+#  STT / TTS
+# ============================================================
 @app.post("/stt")
 async def stt(audio: UploadFile = File(...), lang: str = Form("")):
     audio_bytes = await audio.read()
