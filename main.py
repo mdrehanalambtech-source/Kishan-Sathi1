@@ -4,6 +4,7 @@ import base64
 import time
 import asyncio
 import httpx
+import xml.etree.ElementTree as _ET
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
@@ -1085,10 +1086,10 @@ async def knowledge(force: bool = False):
 
 
 # ============================================================
-#  NEWS — Tavily search (reliable, no IP blocking)
+#  NEWS — Google News RSS (Hindi + English, real news with time)
 # ============================================================
 _NEWS_CACHE = {"ts": 0, "data": None}
-_NEWS_TTL = 3600
+_NEWS_TTL = 1800   # 30 minutes
 
 
 @app.get("/news")
@@ -1099,144 +1100,101 @@ async def news(force: bool = False):
         out["cached"] = True
         return out
 
-    if not TAVILY_KEY:
-        return _news_fallback("no_tavily_key")
-
-    payload = {
-        "query": "India agriculture farmer news today crop mandi MSP weather",
-        "max_results": 10,
-        "search_depth": "basic",
-        "include_domains": [
-            "krishijagran.com",
-            "agrifarming.in",
-            "gaonconnection.com",
-            "down-to-earth.org",
-            "agricoop.gov.in",
-            "thehindu.com",
-            "timesofindia.indiatimes.com",
-            "business-standard.com",
-            "financialexpress.com",
-        ],
-    }
     headers = {
-        "Authorization": f"Bearer {TAVILY_KEY}",
-        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/rss+xml, application/xml, text/xml, */*",
+        "Accept-Language": "hi-IN,hi;q=0.9,en-IN;q=0.8,en;q=0.7",
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=25) as c:
-            r = await c.post(TAVILY_URL, headers=headers, json=payload)
-        if r.status_code != 200:
-            return _news_fallback(f"tavily_{r.status_code}")
-        results = r.json().get("results", [])
-    except Exception as e:
-        return _news_fallback(f"tavily_error")
+    # Try 4 different feeds — Hindi first, then English fallback
+    feed_urls = [
+        "https://news.google.com/rss/search?q=%E0%A4%95%E0%A4%BF%E0%A4%B8%E0%A4%BE%E0%A4%A8+OR+%E0%A4%96%E0%A5%87%E0%A4%A4%E0%A5%80+OR+%E0%A4%95%E0%A5%83%E0%A4%B7%E0%A4%BF&hl=hi-IN&gl=IN&ceid=IN:hi",
+        "https://news.google.com/rss/search?q=%E0%A4%AE%E0%A4%82%E0%A4%A1%E0%A5%80+OR+%E0%A4%AB%E0%A4%B8%E0%A4%B2+OR+%E0%A4%96%E0%A5%87%E0%A4%A4&hl=hi-IN&gl=IN&ceid=IN:hi",
+        "https://news.google.com/rss/search?q=India+farmer+agriculture&hl=en-IN&gl=IN&ceid=IN:en",
+        "https://news.google.com/rss/search?q=mandi+crop+MSP+India&hl=en-IN&gl=IN&ceid=IN:en",
+    ]
 
-    if not results:
-        return _news_fallback("no_results")
+    items = []
+    seen_titles = set()
 
-    # Build snippets and ask Groq to summarize in Hindi
-    snippets = "\n\n".join(
-        f"TITLE: {res.get('title','')}\nURL: {res.get('url','')}\nCONTENT: {res.get('content','')[:350]}"
-        for res in results[:10]
-    )
+    for feed_url in feed_urls:
+        try:
+            async with httpx.AsyncClient(timeout=12, follow_redirects=True) as c:
+                r = await c.get(feed_url, headers=headers)
+            if r.status_code != 200:
+                continue
 
-    system = (
-        "You extract 8 agriculture news items for Indian farmers from search snippets. "
-        "Reply ONLY with JSON array, no prose, no markdown:\n"
-        '[{"title":"हिंदी में छोटा शीर्षक (8 शब्द तक)","detail":"हिंदी में 2 वाक्य","url":"source url"}]\n\n'
-        "Rules:\n"
-        "- Both title and detail in Hindi (Devanagari).\n"
-        "- Only real agriculture/farmer news. Skip ads, opinion.\n"
-        "- Copy exact URL from snippet.\n"
-        "- If no clear news, return []\n"
-    )
-    user = f"Extract 8 news items:\n\n{snippets}"
+            root = _ET.fromstring(r.text)
+            for it in root.iter("item"):
+                title = (it.findtext("title") or "").strip()
+                link = (it.findtext("link") or "").strip()
+                pub = (it.findtext("pubDate") or "").strip()
+                src_el = it.find("source")
+                src = (src_el.text or "").strip() if src_el is not None else ""
 
-    try:
-        text = await groq_chat(system, user, max_tokens=1200)
-    except Exception:
-        return _news_fallback("groq_failed")
+                # Google News titles end with " - SourceName"
+                if src and title.endswith(f" - {src}"):
+                    title = title[: -(len(src) + 3)].strip()
+                elif " - " in title:
+                    parts = title.rsplit(" - ", 1)
+                    if len(parts) == 2:
+                        title = parts[0].strip()
+                        if not src:
+                            src = parts[1].strip()
 
-    text = text.strip()
-    if text.startswith("```"):
-        parts = text.split("```")
-        if len(parts) >= 2:
-            text = parts[1]
-            if text.startswith("json"):
-                text = text[4:]
-    text = text.strip("` \n")
-    first = text.find("[")
-    last = text.rfind("]")
-    if first >= 0 and last > first:
-        text = text[first:last + 1]
+                # Skip duplicates
+                title_key = title[:60].lower()
+                if title_key in seen_titles:
+                    continue
 
-    try:
-        items = json.loads(text)
-    except Exception:
-        return _news_fallback("parse_failed")
+                if title and link and len(title) > 8:
+                    items.append({
+                        "title": title,
+                        "detail": f"{src} • {_human_time(pub)}" if src else _human_time(pub),
+                        "url": link,
+                    })
+                    seen_titles.add(title_key)
 
-    if not isinstance(items, list) or len(items) == 0:
-        return _news_fallback("empty_parse")
+                if len(items) >= 15:
+                    break
 
-    clean = []
-    for it in items[:8]:
-        if isinstance(it, dict) and it.get("title") and it.get("detail"):
-            clean.append({
-                "title": str(it.get("title", ""))[:100],
-                "detail": str(it.get("detail", ""))[:250],
-                "url": str(it.get("url", ""))[:300],
-            })
+            if len(items) >= 15:
+                break
 
-    if not clean:
-        return _news_fallback("empty_clean")
+        except Exception:
+            continue
 
-    result = {"items": clean, "cached": False, "updated_at": int(now)}
+    # If RSS failed completely, return cached or empty
+    if not items:
+        if _NEWS_CACHE["data"]:
+            out = dict(_NEWS_CACHE["data"])
+            out["cached"] = True
+            out["stale"] = True
+            return out
+        return {"items": [], "cached": False, "error": "no_news_available"}
+
+    result = {"items": items[:15], "cached": False, "updated_at": int(now)}
     _NEWS_CACHE["data"] = result
     _NEWS_CACHE["ts"] = now
     return result
 
 
-def _news_fallback(reason: str):
-    """Static fallback news — never empty."""
-    return {
-        "items": [
-            {
-                "title": "खरीफ फसल के लिए मौसम अनुकूल",
-                "detail": "भारत मौसम विभाग के अनुसार अगले कुछ दिन मौसम साफ रहेगा। सिंचाई के लिए यह सही समय है।",
-                "url": "https://mausam.imd.gov.in",
-            },
-            {
-                "title": "PM-KISAN की अगली किस्त जल्द",
-                "detail": "अगली किस्त के लिए पात्र किसान अपना eKYC ज़रूर कर लें। pmkisan.gov.in पर status चेक करें।",
-                "url": "https://pmkisan.gov.in",
-            },
-            {
-                "title": "गेहूं का MSP बढ़ा — किसानों को फायदा",
-                "detail": "सरकार ने न्यूनतम समर्थन मूल्य में बढ़ोतरी की है। किसान अपनी फसल की बिक्री पर ध्यान दें।",
-                "url": "https://agricoop.gov.in",
-            },
-            {
-                "title": "किसान कॉल सेंटर 24x7 उपलब्ध",
-                "detail": "खेती से जुड़ी किसी भी समस्या पर 1800-180-1551 पर मुफ़्त सलाह लें। हिंदी सहित 21 भाषाओं में।",
-                "url": "https://agricoop.gov.in",
-            },
-            {
-                "title": "मिट्टी जाँच ज़रूर करवाएं",
-                "detail": "हर 2 साल में मुफ़्त मिट्टी जाँच करवाएं। soilhealth.dac.gov.in पर रजिस्टर करें।",
-                "url": "https://soilhealth.dac.gov.in",
-            },
-            {
-                "title": "फसल बीमा की समय सीमा जल्द",
-                "detail": "बुआई के 10 दिन के अंदर PMFBY के तहत फसल बीमा ज़रूर करवाएं। pmfby.gov.in पर देखें।",
-                "url": "https://pmfby.gov.in",
-            },
-        ],
-        "cached": False,
-        "updated_at": int(time.time()),
-        "fallback": True,
-        "reason": reason,
-    }
+def _human_time(rfc822: str) -> str:
+    if not rfc822:
+        return ""
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(rfc822)
+        delta = time.time() - dt.timestamp()
+        if delta < 3600:
+            mins = int(delta / 60)
+            return f"{mins} मिनट पहले" if mins > 0 else "अभी"
+        if delta < 86400:
+            return f"{int(delta / 3600)} घंटे पहले"
+        return f"{int(delta / 86400)} दिन पहले"
+    except Exception:
+        return ""
 
 # ============================================================
 #  STT / TTS
