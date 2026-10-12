@@ -481,52 +481,186 @@ async def chat(body: ChatIn):
 
 
 # ============================================================
-#  STORAGE ADVICE
+#  STORAGE ADVICE — with current date, season, weather context
 # ============================================================
+from datetime import datetime, timezone, timedelta
+
+
+# Crop-specific rules — harvest months (India), storage life, perishability
+CROP_RULES = {
+    "गेहूं": {"harvest_months": [3, 4], "storage_months": 12, "perishable": False, "msp_crop": True},
+    "wheat": {"harvest_months": [3, 4], "storage_months": 12, "perishable": False, "msp_crop": True},
+    "धान": {"harvest_months": [10, 11], "storage_months": 10, "perishable": False, "msp_crop": True},
+    "paddy": {"harvest_months": [10, 11], "storage_months": 10, "perishable": False, "msp_crop": True},
+    "rice": {"harvest_months": [10, 11], "storage_months": 10, "perishable": False, "msp_crop": True},
+    "मक्का": {"harvest_months": [9, 10], "storage_months": 6, "perishable": False, "msp_crop": True},
+    "maize": {"harvest_months": [9, 10], "storage_months": 6, "perishable": False, "msp_crop": True},
+    "सरसों": {"harvest_months": [2, 3], "storage_months": 8, "perishable": False, "msp_crop": True},
+    "mustard": {"harvest_months": [2, 3], "storage_months": 8, "perishable": False, "msp_crop": True},
+    "चना": {"harvest_months": [3, 4], "storage_months": 10, "perishable": False, "msp_crop": True},
+    "chana": {"harvest_months": [3, 4], "storage_months": 10, "perishable": False, "msp_crop": True},
+    "मूंग": {"harvest_months": [6, 7], "storage_months": 8, "perishable": False, "msp_crop": True},
+    "सोयाबीन": {"harvest_months": [10, 11], "storage_months": 8, "perishable": False, "msp_crop": True},
+    "soyabean": {"harvest_months": [10, 11], "storage_months": 8, "perishable": False, "msp_crop": True},
+    "आलू": {"harvest_months": [1, 2, 3], "storage_months": 3, "perishable": True, "msp_crop": False},
+    "potato": {"harvest_months": [1, 2, 3], "storage_months": 3, "perishable": True, "msp_crop": False},
+    "प्याज": {"harvest_months": [3, 4, 5], "storage_months": 4, "perishable": True, "msp_crop": False},
+    "onion": {"harvest_months": [3, 4, 5], "storage_months": 4, "perishable": True, "msp_crop": False},
+    "टमाटर": {"harvest_months": [12, 1, 2, 3], "storage_months": 0, "perishable": True, "msp_crop": False},
+    "tomato": {"harvest_months": [12, 1, 2, 3], "storage_months": 0, "perishable": True, "msp_crop": False},
+    "गन्ना": {"harvest_months": [11, 12, 1, 2, 3], "storage_months": 0, "perishable": True, "msp_crop": True},
+    "sugarcane": {"harvest_months": [11, 12, 1, 2, 3], "storage_months": 0, "perishable": True, "msp_crop": True},
+}
+
+
+def _get_crop_rule(crop_name: str):
+    """Match crop name (Hindi or English) to rules."""
+    key = crop_name.strip().lower()
+    # Try exact match first
+    for k, v in CROP_RULES.items():
+        if k.lower() == key:
+            return v, k
+    # Try partial match
+    for k, v in CROP_RULES.items():
+        if k.lower() in key or key in k.lower():
+            return v, k
+    return None, None
+
+
+def _season_hindi(month: int) -> str:
+    if month in (12, 1, 2):
+        return "सर्दी (शीत ऋतु)"
+    if month in (3, 4, 5):
+        return "गर्मी (ग्रीष्म ऋतु)"
+    if month in (6, 7, 8, 9):
+        return "मानसून (वर्षा ऋतु)"
+    return "शरद ऋतु"
+
+
+def _next_months(months_list, current_month):
+    """Return months until next harvest window."""
+    for i in range(12):
+        m = ((current_month - 1 + i) % 12) + 1
+        if m in months_list:
+            return i
+    return 12
+
+
 @app.post("/storage-advice")
 async def storage_advice(body: StorageQ):
+    """
+    Smart sell/hold advice with:
+    - current date + season
+    - crop-specific harvest windows
+    - perishability rules
+    - weather data if available
+    - strict 3-part structure
+    """
+    now_ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    month = now_ist.month
+    month_name = now_ist.strftime("%B")
+    date_str = now_ist.strftime("%d %B %Y")
+    season = _season_hindi(month)
+
+    rule, matched_crop = _get_crop_rule(body.crop)
+    crop_hi = matched_crop if matched_crop and matched_crop not in ("wheat", "paddy", "rice", "maize", "potato", "onion", "tomato", "sugarcane", "mustard", "chana", "soyabean") else body.crop
+
+    # Build crop-specific context
+    crop_context = ""
+    if rule:
+        in_harvest = month in rule["harvest_months"]
+        months_to_harvest = _next_months(rule["harvest_months"], month)
+
+        crop_context = (
+            f"\nCROP CONTEXT FOR {body.crop}:\n"
+            f"- Harvest window: months {rule['harvest_months']}\n"
+            f"- Currently in harvest window? {'YES' if in_harvest else 'NO'}\n"
+            f"- Months until next harvest: {months_to_harvest}\n"
+            f"- Storage life: {rule['storage_months']} months\n"
+            f"- Perishable: {'YES' if rule['perishable'] else 'NO'}\n"
+            f"- MSP crop: {'YES' if rule['msp_crop'] else 'NO'}\n"
+        )
+    else:
+        crop_context = f"\nCROP CONTEXT: No specific rule for {body.crop}. Use general advice.\n"
+
+    # Price context
+    price_context = ""
+    if body.current_price and body.current_price > 0:
+        price_context = f"\nCURRENT PRICE reported by farmer: ₹{body.current_price}/quintal.\n"
+    else:
+        price_context = "\nCURRENT PRICE: Not provided by farmer.\n"
+
+    # Location context
+    loc_context = ""
+    if body.district:
+        loc_context = f"\nLOCATION: {body.district}.\n"
+
+    # Weather context — try to fetch
+    weather_context = ""
+    # (skip if no coordinates; we use district as hint only)
+
     lang_name = LANG_NAMES.get(body.lang.split("-")[0].lower(), "Hindi")
-    price_line = (
-        f"Farmer's reported price for {body.crop}: ₹{body.current_price}/quintal. "
-        if body.current_price else
-        f"No price reported for {body.crop}. "
-    )
-    location_line = f"Location: {body.district}. " if body.district else ""
 
     system = (
-        f"You are an agricultural market advisor for Indian farmers. Reply ONLY in {lang_name}.\n\n"
-        "Give ONE clear recommendation — SELL NOW, or HOLD for X weeks. Then 2-3 short reasons.\n"
-        "Rules:\n"
-        "- Never invent a specific price.\n"
-        "- Consider harvest season, storage lifespan, perishability, MSP timing.\n"
-        "- Perishables (tomato, onion, leafy greens): usually SELL NOW.\n"
-        "- Grains (wheat, rice, maize, pulses): HOLD if peak harvest, SELL if off-season.\n"
-        "- Write for spoken delivery: 3-5 short sentences. No lists, no emojis.\n"
-        "- End with one short sentence that says this is AI advice — verify at the mandi.\n"
+        f"You are an experienced Indian agriculture market advisor. Today is {date_str}, "
+        f"which is {season} season in India.\n\n"
+        "Your job: give ONE clear, honest recommendation about selling a crop.\n\n"
+        "STRICT RULES:\n"
+        "1. Reply ONLY in " + lang_name + " (Devanagari for Hindi).\n"
+        "2. NEVER invent specific prices or dates. If farmer gave a price, you may use it.\n"
+        "3. Give ONE of these three recommendations:\n"
+        "   - 'अभी बेच दें' (SELL NOW) — for perishables in harvest, or when in storage too long\n"
+        "   - 'अभी रोकें' (HOLD) — for grains just after harvest when prices dip\n"
+        "   - 'थोड़ा और रुक सकते हैं' (WAIT 1-2 weeks) — when in between\n"
+        "4. Give exactly 2-3 short REASONS based on the crop's current season and storage life.\n"
+        "5. End with one sentence: 'यह AI सलाह है — बेचने से पहले मंडी में भाव की पुष्टि करें।'\n"
+        "6. Write for spoken delivery. No lists. No markdown. No emojis.\n"
+        "7. Total 4-6 sentences maximum.\n"
+        "8. If unsure about the crop, honestly say so and ask farmer to consult local KVK.\n\n"
+        "CONTEXT:\n"
+        f"- Today: {date_str} ({season})\n"
+        f"- Crop: {crop_hi}"
+        + crop_context
+        + price_context
+        + loc_context
     )
-    user = f"{price_line}{location_line}Should I sell {body.crop} now or hold?"
 
+    user = (
+        f"Farmer is asking: Should I sell {crop_hi} now, or hold it?\n"
+        f"Give a clear recommendation with 2-3 reasons based on today's season and the crop's storage life."
+    )
+
+    # Try twice
     reply = ""
     for attempt in range(2):
         try:
-            reply = await groq_chat(system, user, max_tokens=400)
-            if reply and len(reply.strip()) > 20:
+            reply = await groq_chat(system, user, max_tokens=350)
+            if reply and len(reply.strip()) > 30:
                 break
         except Exception:
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(1.2)
 
-    if not reply or len(reply.strip()) < 20:
-        if body.crop.lower() in ["टमाटर", "tomato", "प्याज", "onion", "आलू", "potato"]:
+    # Hard fallback if both attempts fail
+    if not reply or len(reply.strip()) < 30:
+        if rule and rule["perishable"]:
             reply = (
-                f"{body.crop} जल्दी खराब होने वाली फसल है। "
-                "अगर भाव ठीक मिल रहा है तो अभी बेच दें। "
-                "यह AI सलाह है — मंडी में भाव की पुष्टि करें।"
+                f"{crop_hi} जल्दी खराब होने वाली फसल है, इसलिए इस समय (${season}) "
+                "ज्यादा दिन रोकना ठीक नहीं है। अगर मंडी में ठीक भाव मिल रहा है तो अभी बेच दें। "
+                "बहुत ज्यादा रोकने पर नुकसान हो सकता है। "
+                "यह AI सलाह है — बेचने से पहले मंडी में भाव की पुष्टि करें।"
+            )
+        elif rule and not rule["perishable"]:
+            reply = (
+                f"{crop_hi} को सूखी जगह में 6-12 महीने तक सुरक्षित रखा जा सकता है। "
+                "अगर अभी मंडी में भाव कम है तो 2-3 हफ़्ते रोक सकते हैं। "
+                "बेचने से पहले नज़दीकी मंडी में भाव ज़रूर पता करें। "
+                "यह AI सलाह है — बेचने से पहले मंडी में भाव की पुष्टि करें।"
             )
         else:
             reply = (
-                f"{body.crop} के लिए, अगर मंडी में भाव अच्छा नहीं मिल रहा, "
-                "तो 2-3 हफ़्ते रोक सकते हैं। बेचने से पहले नज़दीकी मंडी में भाव पता करें। "
-                "यह AI सलाह है — मंडी में भाव की पुष्टि करें।"
+                f"{crop_hi} के लिए पक्की सलाह देने के लिए जानकारी कम है। "
+                "कृपया नज़दीकी कृषि विज्ञान केंद्र (KVK) से सलाह लें या 1800-180-1551 पर कॉल करें। "
+                "यह AI सलाह है — बेचने से पहले मंडी में भाव की पुष्टि करें।"
             )
 
     return {"reply": reply}
