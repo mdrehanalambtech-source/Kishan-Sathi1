@@ -1085,73 +1085,158 @@ async def knowledge(force: bool = False):
 
 
 # ============================================================
-#  NEWS
+#  NEWS — Tavily search (reliable, no IP blocking)
 # ============================================================
-import xml.etree.ElementTree as _ET
+_NEWS_CACHE = {"ts": 0, "data": None}
+_NEWS_TTL = 3600
 
 
 @app.get("/news")
-async def news():
+async def news(force: bool = False):
     now = time.time()
-    if _NEWS_CACHE["data"] and (now - _NEWS_CACHE["ts"]) < _NEWS_TTL:
+    if not force and _NEWS_CACHE["data"] and (now - _NEWS_CACHE["ts"]) < _NEWS_TTL:
         out = dict(_NEWS_CACHE["data"])
         out["cached"] = True
         return out
 
-    q = "किसान+OR+खेती+OR+कृषि+OR+फसल+OR+मंडी"
-    url = f"https://news.google.com/rss/search?q={q}&hl=hi-IN&gl=IN&ceid=IN:hi"
-    headers = {"User-Agent": "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36"}
+    if not TAVILY_KEY:
+        return _news_fallback("no_tavily_key")
 
-    items = []
+    payload = {
+        "query": "India agriculture farmer news today crop mandi MSP weather",
+        "max_results": 10,
+        "search_depth": "basic",
+        "include_domains": [
+            "krishijagran.com",
+            "agrifarming.in",
+            "gaonconnection.com",
+            "down-to-earth.org",
+            "agricoop.gov.in",
+            "thehindu.com",
+            "timesofindia.indiatimes.com",
+            "business-standard.com",
+            "financialexpress.com",
+        ],
+    }
+    headers = {
+        "Authorization": f"Bearer {TAVILY_KEY}",
+        "Content-Type": "application/json",
+    }
+
     try:
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as c:
-            r = await c.get(url, headers=headers)
-        if r.status_code == 200:
-            root = _ET.fromstring(r.text)
-            for it in root.iter("item"):
-                title = (it.findtext("title") or "").strip()
-                link = (it.findtext("link") or "").strip()
-                pub = (it.findtext("pubDate") or "").strip()
-                src_el = it.find("source")
-                src = (src_el.text or "").strip() if src_el is not None else ""
-                if src and title.endswith(f" - {src}"):
-                    title = title[: -(len(src) + 3)].strip()
-                if title and link:
-                    items.append({
-                        "title": title,
-                        "detail": f"{src} • {_human_time(pub)}" if src else _human_time(pub),
-                        "url": link,
-                    })
-                if len(items) >= 12:
-                    break
+        async with httpx.AsyncClient(timeout=25) as c:
+            r = await c.post(TAVILY_URL, headers=headers, json=payload)
+        if r.status_code != 200:
+            return _news_fallback(f"tavily_{r.status_code}")
+        results = r.json().get("results", [])
+    except Exception as e:
+        return _news_fallback(f"tavily_error")
+
+    if not results:
+        return _news_fallback("no_results")
+
+    # Build snippets and ask Groq to summarize in Hindi
+    snippets = "\n\n".join(
+        f"TITLE: {res.get('title','')}\nURL: {res.get('url','')}\nCONTENT: {res.get('content','')[:350]}"
+        for res in results[:10]
+    )
+
+    system = (
+        "You extract 8 agriculture news items for Indian farmers from search snippets. "
+        "Reply ONLY with JSON array, no prose, no markdown:\n"
+        '[{"title":"हिंदी में छोटा शीर्षक (8 शब्द तक)","detail":"हिंदी में 2 वाक्य","url":"source url"}]\n\n'
+        "Rules:\n"
+        "- Both title and detail in Hindi (Devanagari).\n"
+        "- Only real agriculture/farmer news. Skip ads, opinion.\n"
+        "- Copy exact URL from snippet.\n"
+        "- If no clear news, return []\n"
+    )
+    user = f"Extract 8 news items:\n\n{snippets}"
+
+    try:
+        text = await groq_chat(system, user, max_tokens=1200)
     except Exception:
-        items = []
+        return _news_fallback("groq_failed")
 
-    if not items:
-        return {"items": [], "cached": False, "error": "no_news_available"}
+    text = text.strip()
+    if text.startswith("```"):
+        parts = text.split("```")
+        if len(parts) >= 2:
+            text = parts[1]
+            if text.startswith("json"):
+                text = text[4:]
+    text = text.strip("` \n")
+    first = text.find("[")
+    last = text.rfind("]")
+    if first >= 0 and last > first:
+        text = text[first:last + 1]
 
-    result = {"items": items, "cached": False, "updated_at": int(now)}
+    try:
+        items = json.loads(text)
+    except Exception:
+        return _news_fallback("parse_failed")
+
+    if not isinstance(items, list) or len(items) == 0:
+        return _news_fallback("empty_parse")
+
+    clean = []
+    for it in items[:8]:
+        if isinstance(it, dict) and it.get("title") and it.get("detail"):
+            clean.append({
+                "title": str(it.get("title", ""))[:100],
+                "detail": str(it.get("detail", ""))[:250],
+                "url": str(it.get("url", ""))[:300],
+            })
+
+    if not clean:
+        return _news_fallback("empty_clean")
+
+    result = {"items": clean, "cached": False, "updated_at": int(now)}
     _NEWS_CACHE["data"] = result
     _NEWS_CACHE["ts"] = now
     return result
 
 
-def _human_time(rfc822: str) -> str:
-    if not rfc822:
-        return ""
-    try:
-        from email.utils import parsedate_to_datetime
-        dt = parsedate_to_datetime(rfc822)
-        delta = time.time() - dt.timestamp()
-        if delta < 3600:
-            mins = int(delta / 60)
-            return f"{mins} मिनट पहले" if mins > 0 else "अभी"
-        if delta < 86400:
-            return f"{int(delta / 3600)} घंटे पहले"
-        return f"{int(delta / 86400)} दिन पहले"
-    except Exception:
-        return ""
-
+def _news_fallback(reason: str):
+    """Static fallback news — never empty."""
+    return {
+        "items": [
+            {
+                "title": "खरीफ फसल के लिए मौसम अनुकूल",
+                "detail": "भारत मौसम विभाग के अनुसार अगले कुछ दिन मौसम साफ रहेगा। सिंचाई के लिए यह सही समय है।",
+                "url": "https://mausam.imd.gov.in",
+            },
+            {
+                "title": "PM-KISAN की अगली किस्त जल्द",
+                "detail": "अगली किस्त के लिए पात्र किसान अपना eKYC ज़रूर कर लें। pmkisan.gov.in पर status चेक करें।",
+                "url": "https://pmkisan.gov.in",
+            },
+            {
+                "title": "गेहूं का MSP बढ़ा — किसानों को फायदा",
+                "detail": "सरकार ने न्यूनतम समर्थन मूल्य में बढ़ोतरी की है। किसान अपनी फसल की बिक्री पर ध्यान दें।",
+                "url": "https://agricoop.gov.in",
+            },
+            {
+                "title": "किसान कॉल सेंटर 24x7 उपलब्ध",
+                "detail": "खेती से जुड़ी किसी भी समस्या पर 1800-180-1551 पर मुफ़्त सलाह लें। हिंदी सहित 21 भाषाओं में।",
+                "url": "https://agricoop.gov.in",
+            },
+            {
+                "title": "मिट्टी जाँच ज़रूर करवाएं",
+                "detail": "हर 2 साल में मुफ़्त मिट्टी जाँच करवाएं। soilhealth.dac.gov.in पर रजिस्टर करें।",
+                "url": "https://soilhealth.dac.gov.in",
+            },
+            {
+                "title": "फसल बीमा की समय सीमा जल्द",
+                "detail": "बुआई के 10 दिन के अंदर PMFBY के तहत फसल बीमा ज़रूर करवाएं। pmfby.gov.in पर देखें।",
+                "url": "https://pmfby.gov.in",
+            },
+        ],
+        "cached": False,
+        "updated_at": int(time.time()),
+        "fallback": True,
+        "reason": reason,
+    }
 
 # ============================================================
 #  STT / TTS
