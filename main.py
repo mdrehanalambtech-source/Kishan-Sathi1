@@ -29,6 +29,7 @@ GROQ_KEY = os.getenv("GROQ_API_KEY", "")
 TAVILY_KEY = os.getenv("TAVILY_API_KEY", "")
 ELEVEN_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVEN_VOICE = os.getenv("ELEVENLABS_VOICE_ID", "")
+DATA_GOV_KEY = os.getenv("DATA_GOV_API_KEY", "579b464db66ec23bdd000001cdd3946e44ce4aad7209ff7b23ac571b")
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 TAVILY_URL = "https://api.tavily.com/search"
@@ -844,54 +845,57 @@ async def mandi_list(
     lat: float | None = None,
     lon: float | None = None,
 ):
-    base = _sample_mandi(state, district)
-    items = base["items"]
-    any_live = False
+    if not district and lat and lon:
+        try:
+            geo = await geocode(lat=lat, lon=lon)
+            district = geo.get("district") or "Patna"
+            state = geo.get("state") or "Bihar"
+        except Exception:
+            pass
 
-    nearby = _nearby_big_mandis(state, district, lat, lon, n=3)
-    loc_terms = [district] + [c for c in nearby if c.lower() != district.lower()]
-
-    live_crops = {
-        "गेहूं": "Wheat",
-        "धान": "Paddy(Dhan)",
-        "आलू": "Potato",
-        "प्याज": "Onion",
+    url = "https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070"
+    params = {
+        "api-key": DATA_GOV_KEY,
+        "format": "json",
+        "limit": 15,
+        "filters[state]": state,
+        "filters[district]": district,
     }
 
-    for crop_hi, crop_en in live_crops.items():
-        try:
-            snippets = await _tavily_search_mandi_multi(crop_en, loc_terms, state)
-            if not snippets:
-                continue
-            extracted = await _extract_prices_from_snippets(snippets, crop_en, district, state)
-            if not extracted or not extracted.get("found"):
-                continue
-            live_items = extracted.get("items", [])
-            if not live_items:
-                continue
-            it = live_items[0]
-            modal = int(it.get("modal", 0) or 0)
-            if modal <= 0:
-                continue
-            for i, existing in enumerate(items):
-                if existing["crop"] == crop_hi:
-                    items[i] = {
-                        "crop": crop_hi, "variety": "सामान्य",
-                        "min": int(it.get("min", modal) or modal),
-                        "max": int(it.get("max", modal) or modal),
-                        "modal": modal,
-                        "trend": "flat", "change": 0,
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.get(url, params=params)
+            
+            if response.status_code == 200:
+                data = response.json()
+                records = data.get("records", [])
+                
+                if records:
+                    items = []
+                    for rec in records:
+                        items.append({
+                            "crop": rec.get("commodity", "फसल"),
+                            "variety": rec.get("variety", "सामान्य"),
+                            "min": int(float(rec.get("min_price", 0))),
+                            "max": int(float(rec.get("max_price", 0))),
+                            "modal": int(float(rec.get("modal_price", 0))),
+                            "trend": "flat",
+                            "change": 0,
+                        })
+                    
+                    return {
+                        "state": state,
+                        "district": district,
+                        "updated": records[0].get("arrival_date", "आज"),
+                        "source": "Government Agmarknet (Live)",
+                        "live": True,
+                        "items": items,
                     }
-                    any_live = True
-                    break
-        except Exception:
-            continue
+    except Exception as e:
+        print(f"Agmarknet API Error: {e}")
 
-    if any_live:
-        base["updated"] = "आज (कुछ भाव live)"
-        base["source"] = f"live web search + अनुमानित — {district}"
-        base["live"] = True
-    return base
+    # Agar API fail ho jaye toh purana sample data dikhega (App crash nahi hogi)
+    return _sample_mandi(state, district)
 
 
 # ============================================================
