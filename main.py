@@ -555,73 +555,66 @@ async def storage_advice(body: StorageQ):
     crop_hi = body.crop
     user_price = body.current_price or 0
 
-    # 1. CROP NAME MAPPING
     crop_map = {
         "गेहूं": "Wheat", "धान": "Paddy(Dhan)", "मक्का": "Maize",
         "सरसों": "Mustard", "आलू": "Potato", "प्याज": "Onion",
         "टमाटर": "Tomato", "गन्ना": "Sugarcane", "चना": "Bengal Gram(Gram)(Whole)"
     }
     crop_en = crop_map.get(crop_hi, crop_hi)
-    
-    # Perishability (Jaldi kharab hone wali fasal)
     perishable_crops = ["Potato", "Onion", "Tomato", "Sugarcane", "आलू", "प्याज", "टमाटर", "गन्ना"]
 
-    # 2. FETCH LIVE MANDI PRICE (With State Fallback)
-live_price = 0
-live_price_text = "आज का लाइव भाव उपलब्ध नहीं है।"
-
-try:
-    url = "https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070"
+    live_price = 0
+    live_price_text = "आज का लाइव भाव उपलब्ध नहीं है।"
     
-    # PEHLE DISTRICT + CROP TRY KARO
-    params = {
-        "api-key": DATA_GOV_KEY,
-        "format": "json",
-        "limit": 1,
-        "filters[state]": state,
-        "filters[district]": district,
-        "filters[commodity]": crop_en,
-    }
-    async with httpx.AsyncClient(timeout=8) as client:
-        res = await client.get(url, params=params)
-        records = res.json().get("records", []) if res.status_code == 200 else []
+    try:
+        url = "https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070"
         
-        # AGAR NAHI MILA, TOH PURE STATE MEIN CROP DHUNDO
-        if not records:
-            params.pop("filters[district]")
-            res2 = await client.get(url, params=params)
-            records = res2.json().get("records", []) if res2.status_code == 200 else []
-
-        # AGAR CROP BHI NAHI MILI, TOH DISTRICT KI DUSRI FASAL DEKHO
-        if not records:
-            params = {
-                "api-key": DATA_GOV_KEY,
-                "format": "json",
-                "limit": 1,
-                "filters[state]": state,
-                "filters[district]": district,
-            }
-            res3 = await client.get(url, params=params)
-            records = res3.json().get("records", []) if res3.status_code == 200 else []
-
-        if records:
-            live_price = int(float(records[0].get("modal_price", "0")))
-            actual_market = records[0].get("market", district)
-            actual_crop = records[0].get("commodity", crop_hi)
+        params = {
+            "api-key": DATA_GOV_KEY,
+            "format": "json",
+            "limit": 1,
+            "filters[state]": state,
+            "filters[district]": district,
+            "filters[commodity]": crop_en,
+        }
+        
+        # 🚨 ध्यान दें: नीचे वाली लाइन 8 स्पेस (या 2 Tab) छोड़कर शुरू हो रही है
+        async with httpx.AsyncClient(timeout=8) as client:
+            res = await client.get(url, params=params)
+            records = res.json().get("records", []) if res.status_code == 200 else []
             
-            if actual_crop == crop_en:
-                live_price_text = f"आज {actual_market} मंडी में {crop_hi} का लाइव भाव ₹{live_price} प्रति क्विंटल है।"
-            else:
-                live_price_text = f"आज {actual_market} मंडी में {actual_crop} का भाव ₹{live_price} चल रहा है (आपकी फसल का आज डेटा नहीं है)।"
-except Exception as e:
-    print(f"Agmarknet API Error: {e}")
+            if not records:
+                params.pop("filters[district]")
+                res2 = await client.get(url, params=params)
+                records = res2.json().get("records", []) if res2.status_code == 200 else []
 
-    # 3. HARD-CODED LOGIC (No AI guessing)
-    # Agar user ne price nahi dala, toh live price ko benchmark banao
+            if not records:
+                params = {
+                    "api-key": DATA_GOV_KEY,
+                    "format": "json",
+                    "limit": 1,
+                    "filters[state]": state,
+                    "filters[district]": district,
+                }
+                res3 = await client.get(url, params=params)
+                records = res3.json().get("records", []) if res3.status_code == 200 else []
+
+            if records:
+                live_price = int(float(records[0].get("modal_price", "0")))
+                actual_market = records[0].get("market", district)
+                actual_crop = records[0].get("commodity", crop_hi)
+                
+                if actual_crop == crop_en:
+                    live_price_text = f"आज {actual_market} मंडी में {crop_hi} का लाइव भाव ₹{live_price} प्रति क्विंटल है।"
+                else:
+                    live_price_text = f"आज {actual_market} मंडी में {actual_crop} का भाव ₹{live_price} चल रहा है (आपकी फसल का आज डेटा नहीं है)।"
+                    
+    except Exception as e:
+        print(f"Agmarknet API Error: {e}")
+
     if user_price == 0 and live_price > 0:
         user_price = live_price
         
-    # Logic to decide SELL or HOLD
     decision = "HOLD"
     reason_1 = ""
     reason_2 = ""
@@ -629,11 +622,11 @@ except Exception as e:
     if live_price > 0 and user_price > 0:
         if user_price > live_price + 50:
             decision = "SELL"
-            reason_1 = f"आपको ₹{user_price} मिल रहे हैं जो आज के मंडी भाव (₹{live_price}) से ज़्यादा है।"
+            reason_1 = f"आपको ₹{user_price} मिल रहे हैं जो मंडी के भाव (₹{live_price}) से ज़्यादा है।"
             reason_2 = "इससे बेहतर मौका शायद ही मिले, इसलिए अभी बेच देना फायदेमंद है।"
         elif user_price < live_price - 50:
             decision = "HOLD"
-            reason_1 = f"आपको ₹{user_price} मिल रहे हैं जो आज के मंडी भाव (₹{live_price}) से कम है।"
+            reason_1 = f"आपको ₹{user_price} मिल रहे हैं जो मंडी के भाव (₹{live_price}) से कम है।"
             if crop_en in perishable_crops:
                 decision = "SELL"
                 reason_2 = "लेकिन यह जल्दी खराब होने वाली फसल है, इसलिए ज़्यादा इंतज़ार मत करें। जितना मिल रहा है उसमें बेच दें।"
@@ -644,7 +637,6 @@ except Exception as e:
             reason_1 = f"आज का मंडी भाव ₹{live_price} के आस-पास है।"
             reason_2 = "भाव स्थिर है, थोड़ा और इंतज़ार किया जा सकता है।"
     else:
-        # Agar live price nahi mila
         if crop_en in perishable_crops:
             decision = "SELL"
             reason_1 = "यह जल्दी खराब होने वाली फसल है।"
@@ -654,24 +646,18 @@ except Exception as e:
             reason_1 = "लाइव भाव नहीं मिल पा रहा है।"
             reason_2 = "सूखी जगह में रखें और स्थानीय मंडी में भाव चेक करें।"
 
-    # 4. AI SIRF LANGUAGE BADLEGA, DECISION NAHI
     system = (
-        f"You are a translator and advisor. Reply ONLY in {lang_name}. "
-        "Your job is to present the following market decision clearly to the farmer. "
-        "Do NOT invent any new reasons. Do NOT change the decision. "
-        "Keep it to 3-4 short sentences for voice output. "
+        f"You are a translator. Reply ONLY in {lang_name}. "
+        "Present the following market decision clearly. Do NOT invent reasons. "
         "End with: 'यह AI सलाह है — मंडी में भाव की पुष्टि करें।'\n\n"
-        f"DECISION: {decision} (SELL or HOLD)\n"
+        f"DECISION: {decision}\n"
         f"REASON 1: {reason_1}\n"
         f"REASON 2: {reason_2}\n"
     )
 
-    user_msg = f"Explain this decision to the farmer in {lang_name}."
-    
     try:
-        final_reply = await groq_chat(system, user_msg, max_tokens=200)
+        final_reply = await groq_chat(system, "Explain this in Hindi.", max_tokens=200)
     except Exception:
-        # Agar AI fail ho, toh direct Hindi text
         if decision == "SELL":
             final_reply = f"{reason_1} {reason_2} इसलिए आपको अभी बेच देना चाहिए। यह AI सलाह है — मंडी में भाव की पुष्टि करें।"
         else:
@@ -680,7 +666,7 @@ except Exception as e:
     return {
         "reply": final_reply,
         "live_price": live_price_text,
-        "trend": "मंडी भाव के अनुसार" 
+        "trend": "लाइव मंडी डेटा"
     }
 
 # ============================================================
