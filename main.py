@@ -566,28 +566,55 @@ async def storage_advice(body: StorageQ):
     # Perishability (Jaldi kharab hone wali fasal)
     perishable_crops = ["Potato", "Onion", "Tomato", "Sugarcane", "आलू", "प्याज", "टमाटर", "गन्ना"]
 
-    # 2. FETCH LIVE MANDI PRICE (Agmarknet)
-    live_price = 0
-    live_price_text = "आज का लाइव भाव उपलब्ध नहीं है।"
-    try:
-        url = "https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070"
-        params = {
-            "api-key": DATA_GOV_KEY,
-            "format": "json",
-            "limit": 1,
-            "filters[state]": state,
-            "filters[district]": district,
-            "filters[commodity]": crop_en,
-        }
-        async with httpx.AsyncClient(timeout=8) as client:
-            res = await client.get(url, params=params)
-            if res.status_code == 200:
-                records = res.json().get("records", [])
-                if records:
-                    live_price = int(float(records[0].get("modal_price", "0")))
-                    live_price_text = f"आज {district} मंडी में {crop_hi} का लाइव भाव ₹{live_price} प्रति क्विंटल है।"
-    except Exception:
-        pass
+    # 2. FETCH LIVE MANDI PRICE (With State Fallback)
+live_price = 0
+live_price_text = "आज का लाइव भाव उपलब्ध नहीं है।"
+
+try:
+    url = "https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070"
+    
+    # PEHLE DISTRICT + CROP TRY KARO
+    params = {
+        "api-key": DATA_GOV_KEY,
+        "format": "json",
+        "limit": 1,
+        "filters[state]": state,
+        "filters[district]": district,
+        "filters[commodity]": crop_en,
+    }
+    async with httpx.AsyncClient(timeout=8) as client:
+        res = await client.get(url, params=params)
+        records = res.json().get("records", []) if res.status_code == 200 else []
+        
+        # AGAR NAHI MILA, TOH PURE STATE MEIN CROP DHUNDO
+        if not records:
+            params.pop("filters[district]")
+            res2 = await client.get(url, params=params)
+            records = res2.json().get("records", []) if res2.status_code == 200 else []
+
+        # AGAR CROP BHI NAHI MILI, TOH DISTRICT KI DUSRI FASAL DEKHO
+        if not records:
+            params = {
+                "api-key": DATA_GOV_KEY,
+                "format": "json",
+                "limit": 1,
+                "filters[state]": state,
+                "filters[district]": district,
+            }
+            res3 = await client.get(url, params=params)
+            records = res3.json().get("records", []) if res3.status_code == 200 else []
+
+        if records:
+            live_price = int(float(records[0].get("modal_price", "0")))
+            actual_market = records[0].get("market", district)
+            actual_crop = records[0].get("commodity", crop_hi)
+            
+            if actual_crop == crop_en:
+                live_price_text = f"आज {actual_market} मंडी में {crop_hi} का लाइव भाव ₹{live_price} प्रति क्विंटल है।"
+            else:
+                live_price_text = f"आज {actual_market} मंडी में {actual_crop} का भाव ₹{live_price} चल रहा है (आपकी फसल का आज डेटा नहीं है)।"
+except Exception as e:
+    print(f"Agmarknet API Error: {e}")
 
     # 3. HARD-CODED LOGIC (No AI guessing)
     # Agar user ne price nahi dala, toh live price ko benchmark banao
@@ -834,58 +861,56 @@ async def mandi_list(
     lat: float | None = None,
     lon: float | None = None,
 ):
-    if not district and lat and lon:
-        try:
-            geo = await geocode(lat=lat, lon=lon)
-            district = geo.get("district") or "Patna"
-            state = geo.get("state") or "Bihar"
-        except Exception:
-            pass
+    # ... (purana geocode logic) ...
 
     url = "https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070"
-    params = {
-        "api-key": DATA_GOV_KEY,
-        "format": "json",
-        "limit": 15,
-        "filters[state]": state,
-        "filters[district]": district,
-    }
-
+    
     try:
+        # PEHLE DISTRICT TRY KARO
+        params = {
+            "api-key": DATA_GOV_KEY,
+            "format": "json",
+            "limit": 15,
+            "filters[state]": state,
+            "filters[district]": district,
+        }
         async with httpx.AsyncClient(timeout=15) as client:
             response = await client.get(url, params=params)
+            records = response.json().get("records", []) if response.status_code == 200 else []
             
-            if response.status_code == 200:
-                data = response.json()
-                records = data.get("records", [])
-                
+            # AGAR DISTRICT MEIN DATA NAHI HAI, TOH PURE RAJYA KA DATA LE AAYO
+            if not records:
+                params.pop("filters[district]")
+                response2 = await client.get(url, params=params)
+                records = response2.json().get("records", []) if response2.status_code == 200 else []
                 if records:
-                    items = []
-                    for rec in records:
-                        items.append({
-                            "crop": rec.get("commodity", "फसल"),
-                            "variety": rec.get("variety", "सामान्य"),
-                            "min": int(float(rec.get("min_price", 0))),
-                            "max": int(float(rec.get("max_price", 0))),
-                            "modal": int(float(rec.get("modal_price", 0))),
-                            "trend": "flat",
-                            "change": 0,
-                        })
-                    
-                    return {
-                        "state": state,
-                        "district": district,
-                        "updated": records[0].get("arrival_date", "आज"),
-                        "source": "Government Agmarknet (Live)",
-                        "live": True,
-                        "items": items,
-                    }
+                    district = "Bihar (राज्य भर से)" # UI mein dikhane ke liye
+
+            if records:
+                items = []
+                for rec in records:
+                    items.append({
+                        "crop": rec.get("commodity", "फसल"),
+                        "variety": rec.get("variety", "सामान्य"),
+                        "min": int(float(rec.get("min_price", 0))),
+                        "max": int(float(rec.get("max_price", 0))),
+                        "modal": int(float(rec.get("modal_price", 0))),
+                        "trend": "flat",
+                        "change": 0,
+                    })
+                
+                return {
+                    "state": state,
+                    "district": district,
+                    "updated": records[0].get("arrival_date", "आज"),
+                    "source": "Government Agmarknet (Live)",
+                    "live": True,
+                    "items": items,
+                }
     except Exception as e:
         print(f"Agmarknet API Error: {e}")
 
-    # Agar API fail ho jaye toh purana sample data dikhega (App crash nahi hogi)
     return _sample_mandi(state, district)
-
 
 # ============================================================
 #  SCHEMES
