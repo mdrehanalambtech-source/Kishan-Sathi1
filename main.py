@@ -549,7 +549,6 @@ def _next_months(months_list, current_month):
 
 @app.post("/storage-advice")
 async def storage_advice(body: StorageQ):
-    lang_name = LANG_NAMES.get(body.lang.split("-")[0].lower(), "Hindi")
     district = body.district or "Patna"
     state = body.state or "Bihar"
     crop_hi = body.crop
@@ -564,54 +563,54 @@ async def storage_advice(body: StorageQ):
     perishable_crops = ["Potato", "Onion", "Tomato", "Sugarcane", "आलू", "प्याज", "टमाटर", "गन्ना"]
 
     live_price = 0
+    min_price = 0
+    max_price = 0
+    market_trend = "neutral" # strong, falling, neutral
     live_price_text = "आज का लाइव भाव उपलब्ध नहीं है।"
     
+    # 1. LIVE MANDI DATA CHECK
     try:
         url = "https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070"
-        
         params = {
-            "api-key": DATA_GOV_KEY,
-            "format": "json",
-            "limit": 1,
-            "filters[state]": state,
-            "filters[district]": district,
-            "filters[commodity]": crop_en,
+            "api-key": DATA_GOV_KEY, "format": "json", "limit": 1, 
+            "filters[state]": state, "filters[district]": district, "filters[commodity]": crop_en
         }
         
-        # 🚨 ध्यान दें: नीचे वाली लाइन 8 स्पेस (या 2 Tab) छोड़कर शुरू हो रही है
-        async with httpx.AsyncClient(timeout=8) as client:
+        async with httpx.AsyncClient(timeout=6) as client:
             res = await client.get(url, params=params)
             records = res.json().get("records", []) if res.status_code == 200 else []
             
+            # Fallback to state if district fails
             if not records:
                 params.pop("filters[district]")
                 res2 = await client.get(url, params=params)
                 records = res2.json().get("records", []) if res2.status_code == 200 else []
 
-            if not records:
-                params = {
-                    "api-key": DATA_GOV_KEY,
-                    "format": "json",
-                    "limit": 1,
-                    "filters[state]": state,
-                    "filters[district]": district,
-                }
-                res3 = await client.get(url, params=params)
-                records = res3.json().get("records", []) if res3.status_code == 200 else []
-
             if records:
-                live_price = int(float(records[0].get("modal_price", "0")))
-                actual_market = records[0].get("market", district)
-                actual_crop = records[0].get("commodity", crop_hi)
+                rec = records[0]
+                live_price = int(float(rec.get("modal_price", "0")))
+                min_price = int(float(rec.get("min_price", "0")))
+                max_price = int(float(rec.get("max_price", "0")))
+                actual_market = rec.get("market", district)
+                actual_crop = rec.get("commodity", crop_hi)
                 
-                if actual_crop == crop_en:
-                    live_price_text = f"आज {actual_market} मंडी में {crop_hi} का लाइव भाव ₹{live_price} प्रति क्विंटल है।"
-                else:
-                    live_price_text = f"आज {actual_market} मंडी में {actual_crop} का भाव ₹{live_price} चल रहा है (आपकी फसल का आज डेटा नहीं है)।"
-                    
+                live_price_text = f"आज {actual_market} मंडी में {actual_crop} का भाव ₹{min_price} से ₹{max_price} के बीच है (सामान्य भाव ₹{live_price})।"
+                
+                # 🎯 MARKET TREND CALCULATION (Logic)
+                spread = max_price - min_price
+                if spread > 0:
+                    position = (live_price - min_price) / spread
+                    if position > 0.7:
+                        market_trend = "strong"  # भाव ऊपर जा रहा है (Max के करीब)
+                    elif position < 0.3:
+                        market_trend = "falling" # भाव नीचे आ रहा है (Min के करीब)
+                    else:
+                        market_trend = "neutral"
+                        
     except Exception as e:
-        print(f"Agmarknet API Error: {e}")
+        print(f"Govt API Failed in Advice: {e}")
 
+    # 2. DECISION LOGIC (Data-Driven)
     if user_price == 0 and live_price > 0:
         user_price = live_price
         
@@ -620,53 +619,58 @@ async def storage_advice(body: StorageQ):
     reason_2 = ""
     
     if live_price > 0 and user_price > 0:
-        if user_price > live_price + 50:
+        if user_price >= live_price:
             decision = "SELL"
-            reason_1 = f"आपको ₹{user_price} मिल रहे हैं जो मंडी के भाव (₹{live_price}) से ज़्यादा है।"
-            reason_2 = "इससे बेहतर मौका शायद ही मिले, इसलिए अभी बेच देना फायदेमंद है।"
-        elif user_price < live_price - 50:
-            decision = "HOLD"
-            reason_1 = f"आपको ₹{user_price} मिल रहे हैं जो मंडी के भाव (₹{live_price}) से कम है।"
+            reason_1 = f"आपको ₹{user_price} मिल रहे हैं जो आज के सामान्य मंडी भाव (₹{live_price}) के बराबर या उससे अच्छा है।"
+            reason_2 = "मार्केट में इससे बेहतर दाम मिलने की उम्मीद कम है, इसलिए अभी बेच देना फायदेमंद है।"
+        else:
             if crop_en in perishable_crops:
                 decision = "SELL"
+                reason_1 = f"आपको ₹{user_price} मिल रहे हैं, जो मंडी भाव (₹{live_price}) से कम है।"
                 reason_2 = "लेकिन यह जल्दी खराब होने वाली फसल है, इसलिए ज़्यादा इंतज़ार मत करें। जितना मिल रहा है उसमें बेच दें।"
+            elif market_trend == "falling":
+                decision = "SELL"
+                reason_1 = f"आज मंडी भाव ₹{live_price} है, लेकिन बाज़ार कमज़ोर दिख रहा है (भाव ₹{min_price} तक गिर रहा है)।"
+                reason_2 = "भाव और नीचे जाने से पहले, आपको ₹{user_price} में बेचने पर विचार करना चाहिए।"
+            elif market_trend == "strong":
+                decision = "HOLD"
+                reason_1 = f"आज मंडी भाव ₹{live_price} है और मांग अच्छी दिख रही है (अधिकतम ₹{max_price} तक जा रहा है)।"
+                reason_2 = "अगर आपके पास स्टोर करने की जगह है, तो कुछ दिन रुककर और अच्छा दाम मिल सकता है।"
             else:
-                reason_2 = "आपको थोड़ा इंतज़ार करना चाहिए, भाव बढ़ने का इंतज़ार करें।"
-        else:
-            decision = "HOLD"
-            reason_1 = f"आज का मंडी भाव ₹{live_price} के आस-पास है।"
-            reason_2 = "भाव स्थिर है, थोड़ा और इंतज़ार किया जा सकता है।"
+                decision = "HOLD"
+                reason_1 = f"आज का मंडी भाव ₹{live_price} के आस-पास है।"
+                reason_2 = "बाज़ार स्थिर है, आप थोड़ा इंतज़ार करके देख सकते हैं।"
     else:
+        # Fallback if no data
         if crop_en in perishable_crops:
             decision = "SELL"
             reason_1 = "यह जल्दी खराब होने वाली फसल है।"
-            reason_2 = "लाइव भाव नहीं मिल पा रहा, पर इसे ज़्यादा दिन रोखना ठीक नहीं है।"
+            reason_2 = "लाइव भाव नहीं मिल रहा, पर इसे ज़्यादा दिन रोखना ठीक नहीं है।"
         else:
             decision = "HOLD"
-            reason_1 = "लाइव भाव नहीं मिल पा रहा है।"
+            reason_1 = "लाइव भाव उपलब्ध नहीं है।"
             reason_2 = "सूखी जगह में रखें और स्थानीय मंडी में भाव चेक करें।"
 
+    # 3. TRANSLATE TO HINDI (Strict Prompt)
     system = (
-        f"You are a translator. Reply ONLY in {lang_name}. "
-        "Present the following market decision clearly. Do NOT invent reasons. "
-        "End with: 'यह AI सलाह है — मंडी में भाव की पुष्टि करें।'\n\n"
-        f"DECISION: {decision}\n"
-        f"REASON 1: {reason_1}\n"
-        f"REASON 2: {reason_2}\n"
+        "You are a translator speaking to a farmer. "
+        "Translate the following decision EXACTLY into natural Hindi. "
+        "DO NOT add any new reasons or change the meaning. Keep it short. "
+        f"End with: 'यह AI सलाह है — मंडी में भाव की पुष्टि करें।'\n\n"
+        f"Decision: {decision}\n"
+        f"Reason 1: {reason_1}\n"
+        f"Reason 2: {reason_2}"
     )
-
+    
     try:
-        final_reply = await groq_chat(system, "Explain this in Hindi.", max_tokens=200)
+        final_reply = await groq_chat(system, "Translate.", max_tokens=150)
     except Exception:
-        if decision == "SELL":
-            final_reply = f"{reason_1} {reason_2} इसलिए आपको अभी बेच देना चाहिए। यह AI सलाह है — मंडी में भाव की पुष्टि करें।"
-        else:
-            final_reply = f"{reason_1} {reason_2} इसलिए आपको थोड़ा इंतज़ार करना चाहिए। यह AI सलाह है — मंडी में भाव की पुष्टि करें।"
+        final_reply = f"{reason_1} {reason_2} यह AI सलाह है — मंडी में भाव की पुष्टि करें।"
 
     return {
         "reply": final_reply,
         "live_price": live_price_text,
-        "trend": "लाइव मंडी डेटा"
+        "trend": f"बाज़ार: {market_trend}"
     }
 
 # ============================================================
