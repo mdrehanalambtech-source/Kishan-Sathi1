@@ -856,10 +856,9 @@ async def mandi_list(
             pass
 
     url = "https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070"
-    is_state_fallback = False
     
+    # 1. TRY GOVT API (Short Timeout)
     try:
-        # 1. पहले सीधा जिले का डेटा मांगो
         params = {
             "api-key": DATA_GOV_KEY,
             "format": "json",
@@ -867,55 +866,76 @@ async def mandi_list(
             "filters[state]": state,
             "filters[district]": district,
         }
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=6) as client:
             res = await client.get(url, params=params)
             records = res.json().get("records", []) if res.status_code == 200 else []
             
-            # 2. अगर जिले का डेटा नहीं है, तो राज्य का डेटा लाओ
             if not records:
-                is_state_fallback = True
                 params.pop("filters[district]")
                 res2 = await client.get(url, params=params)
                 records = res2.json().get("records", []) if res2.status_code == 200 else []
+                if records: district = f"{district} (आस-पास)"
 
             if records:
                 items = []
                 for rec in records:
-                    # डुप्लीकेट फसलों को हटाने के लिए सेट का इस्तेमाल
-                    crop_name = rec.get("commodity", "फसल")
-                    if any(i['crop'] == crop_name for i in items):
-                        continue
-
+                    if any(i['crop'] == rec.get("commodity") for i in items): continue
                     items.append({
-                        "crop": crop_name,
+                        "crop": rec.get("commodity", "फसल"),
                         "variety": rec.get("variety", "सामान्य"),
-                        "market": rec.get("market", district), # 🎯 मंडी का नाम
-                        "date": rec.get("arrival_date", "आज"), # 🎯 तारीख
+                        "market": rec.get("market", district),
+                        "date": rec.get("arrival_date", "आज"),
                         "min": int(float(rec.get("min_price", 0))),
                         "max": int(float(rec.get("max_price", 0))),
                         "modal": int(float(rec.get("modal_price", 0))),
+                        "trend": "flat", "change": 0,
                     })
-                
-                # अगर राज्य का डेटा है, तो डिस्ट्रिक्ट का नाम बदलकर बताओ
-                display_district = f"{district} (आस-पास)" if is_state_fallback else district
-                
                 return {
-                    "state": state,
-                    "district": display_district,
-                    "updated": records[0].get("arrival_date", "आज"),
-                    "source": "Government Agmarknet (Live)",
-                    "live": True,
-                    "items": items,
+                    "state": state, "district": district, "updated": records[0].get("arrival_date", "आज"),
+                    "source": "Government Agmarknet (Live)", "live": True, "items": items,
                 }
     except Exception as e:
-        print(f"Agmarknet API Error: {e}")
+        print(f"Govt API Failed: {e}")
 
-    # 3. अगर सर्वर पूरी तरह डाउन है, तो सैंपल डेटा (साफ शब्दों में)
+    # 2. FALLBACK: TAVILY WEB SEARCH (अगर सरकारी API फेल हो जाए)
+    if TAVILY_KEY:
+        try:
+            query = f"{district} mandi {state} today crop prices Agmarknet"
+            headers = {"Authorization": f"Bearer {TAVILY_KEY}", "Content-Type": "application/json"}
+            payload = {"query": query, "max_results": 3, "search_depth": "basic"}
+            
+            async with httpx.AsyncClient(timeout=10) as client:
+                res = await client.post(TAVILY_URL, headers=headers, json=payload)
+                if res.status_code == 200:
+                    results = res.json().get("results", [])
+                    if results:
+                        snippets = " ".join([r.get("content", "") for r in results])
+                        # AI से डेटा निकालवाएं
+                        system = "Extract up to 5 crop prices from this text. Reply ONLY in JSON array format: [{'crop':'Wheat', 'modal':2200}]. No other text."
+                        text = await groq_chat(system, snippets, max_tokens=300)
+                        
+                        # Parse AI response safely
+                        text = text.strip()
+                        if text.startswith("```"): text = text.split("```")[1]
+                        if text.startswith("json"): text = text[4:]
+                        first, last = text.find("["), text.rfind("]")
+                        if first >= 0 and last > first:
+                            extracted = json.loads(text[first:last+1])
+                            if extracted and len(extracted) > 0:
+                                items = [{"crop": e.get("crop", "फसल"), "variety": "सामान्य", "market": district, "date": "आज", "min": e.get("modal", 0)-100, "max": e.get("modal", 0)+100, "modal": e.get("modal", 0), "trend": "flat", "change": 0} for e in extracted]
+                                return {
+                                    "state": state, "district": district, "updated": "आज (वेब से)",
+                                    "source": "Live Web Data", "live": True, "items": items,
+                                }
+        except Exception as e:
+            print(f"Tavily Fallback Failed: {e}")
+
+    # 3. LAST RESORT: Hardcoded Sample (सिर्फ तब जब दोनों फेल हो जाएं)
     base = _sample_mandi(state, district)
-    for item in base["items"]:
-        item["market"] = "सैंपल डेटा (API डाउन है)"
-        item["date"] = "आज"
+    base["district"] = f"{district} (सैंपल डेटा)"
+    base["source"] = "सरकारी सर्वर डाउन है, कृपया नज़दीकी मंडी में संपर्क करें"
     return base
+
 
 @app.post("/storage-advice")
 async def storage_advice(body: StorageQ):
@@ -935,15 +955,15 @@ async def storage_advice(body: StorageQ):
     live_price = 0
     live_price_text = "आज का लाइव भाव उपलब्ध नहीं है।"
     
+    # TRY GOVT API (Short Timeout)
     try:
         url = "https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070"
         params = {"api-key": DATA_GOV_KEY, "format": "json", "limit": 1, "filters[state]": state, "filters[district]": district, "filters[commodity]": crop_en}
         
-        async with httpx.AsyncClient(timeout=8) as client:
+        async with httpx.AsyncClient(timeout=6) as client:
             res = await client.get(url, params=params)
             records = res.json().get("records", []) if res.status_code == 200 else []
             
-            # फॉलबैक 1: पूरे राज्य में फसल खोजो
             if not records:
                 params.pop("filters[district]")
                 res2 = await client.get(url, params=params)
@@ -952,14 +972,31 @@ async def storage_advice(body: StorageQ):
             if records:
                 live_price = int(float(records[0].get("modal_price", "0")))
                 actual_market = records[0].get("market", district)
-                actual_crop = records[0].get("commodity", crop_hi)
-                live_price_text = f"आज {actual_market} मंडी में {actual_crop} का लाइव भाव ₹{live_price} प्रति क्विंटल है।"
+                live_price_text = f"आज {actual_market} मंडी में {crop_en} का लाइव भाव ₹{live_price} प्रति क्विंटल है।"
     except Exception as e:
-        print(f"Agmarknet API Error: {e}")
+        print(f"Govt API Failed in Advice: {e}")
 
-    # ==========================================
-    # 🧠 असली RULE-BASED सलाह (कोई AI नहीं)
-    # ==========================================
+    # IF GOVT API FAILS -> USE TAVILY TO FIND PRICE
+    if live_price == 0 and TAVILY_KEY:
+        try:
+            query = f"{crop_en} mandi price today {district} {state} per quintal"
+            headers = {"Authorization": f"Bearer {TAVILY_KEY}", "Content-Type": "application/json"}
+            payload = {"query": query, "max_results": 3}
+            async with httpx.AsyncClient(timeout=10) as client:
+                res = await client.post(TAVILY_URL, headers=headers, json=payload)
+                if res.status_code == 200:
+                    snippets = " ".join([r.get("content", "") for r in res.json().get("results", [])])
+                    system = "Extract the price per quintal for this crop from the text. Reply ONLY with the number. If not found, reply 0."
+                    price_str = await groq_chat(system, snippets, max_tokens=20)
+                    import re
+                    nums = re.findall(r'\d+', price_str)
+                    if nums and int(nums[0]) > 500:
+                        live_price = int(nums[0])
+                        live_price_text = f"वेब रिसर्च के अनुसार आज {district} में {crop_en} का भाव लगभग ₹{live_price} चल रहा है।"
+        except Exception as e:
+            print(f"Tavily Price Failed: {e}")
+
+    # HARDCODED LOGIC (No AI guessing)
     if user_price == 0 and live_price > 0:
         user_price = live_price
         
@@ -970,14 +1007,14 @@ async def storage_advice(body: StorageQ):
     if live_price > 0 and user_price > 0:
         if user_price > live_price + 50:
             decision = "SELL"
-            reason_1 = f"आपको ₹{user_price} मिल रहे हैं जो आज के मंडी भाव (₹{live_price}) से ज़्यादा है।"
+            reason_1 = f"आपको ₹{user_price} मिल रहे हैं जो मंडी के भाव (₹{live_price}) से ज़्यादा है।"
             reason_2 = "इससे बेहतर मौका शायद ही मिले, इसलिए अभी बेच देना फायदेमंद है।"
         elif user_price < live_price - 50:
             decision = "HOLD"
-            reason_1 = f"आपको ₹{user_price} मिल रहे हैं जो आज के मंडी भाव (₹{live_price}) से कम है।"
+            reason_1 = f"आपको ₹{user_price} मिल रहे हैं जो मंडी के भाव (₹{live_price}) से कम है।"
             if crop_en in perishable_crops:
                 decision = "SELL"
-                reason_2 = "लेकिन चूंकि यह जल्दी खराब होने वाली फसल है, इसलिए ज़्यादा इंतज़ार मत करें। जितना मिल रहा है उसमें बेच दें।"
+                reason_2 = "लेकिन यह जल्दी खराब होने वाली फसल है, इसलिए ज़्यादा इंतज़ार मत करें। जितना मिल रहा है उसमें बेच दें।"
             else:
                 reason_2 = "आपको थोड़ा इंतज़ार करना चाहिए, भाव बढ़ने का इंतज़ार करें।"
         else:
@@ -994,7 +1031,6 @@ async def storage_advice(body: StorageQ):
             reason_1 = "लाइव भाव नहीं मिल पा रहा है।"
             reason_2 = "सूखी जगह में रखें और स्थानीय मंडी में भाव चेक करें।"
 
-    # AI का काम सिर्फ इसे सुंदर हिंदी में बदलना है
     system = f"You are a translator. Reply ONLY in Hindi. Present this decision clearly: '{reason_1} {reason_2}' and end with 'यह AI सलाह है — मंडी में भाव की पुष्टि करें।'"
     
     try:
@@ -1005,9 +1041,8 @@ async def storage_advice(body: StorageQ):
     return {
         "reply": final_reply,
         "live_price": live_price_text,
-        "trend": "मंडी डेटा"
+        "trend": "लाइव वेब डेटा"
     }
-
 
 
 # ============================================================
