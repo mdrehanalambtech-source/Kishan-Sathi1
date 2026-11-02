@@ -851,26 +851,23 @@ async def mandi_list(
     lat: float | None = None,
     lon: float | None = None,
 ):
-    if not district and lat and lon:
-        try:
+    try:
+        if not district and lat and lon:
             geo = await geocode(lat=lat, lon=lon)
             district = geo.get("district") or "Patna"
             state = geo.get("state") or "Bihar"
-        except Exception:
-            pass
 
-    url = "https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070"
-    
-    # 1. TRY GOVT API (Short Timeout)
-    try:
+        url = "https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070"
+        
         params = {
             "api-key": DATA_GOV_KEY,
             "format": "json",
-            "limit": 20,
+            "limit": 15,
             "filters[state]": state,
             "filters[district]": district,
         }
-        async with httpx.AsyncClient(timeout=6) as client:
+        
+        async with httpx.AsyncClient(timeout=5) as client:
             res = await client.get(url, params=params)
             records = res.json().get("records", []) if res.status_code == 200 else []
             
@@ -899,47 +896,12 @@ async def mandi_list(
                     "source": "Government Agmarknet (Live)", "live": True, "items": items,
                 }
     except Exception as e:
-        print(f"Govt API Failed: {e}")
+        print(f"API Error: {e}")
 
-    # 2. FALLBACK: TAVILY WEB SEARCH (अगर सरकारी API फेल हो जाए)
-    if TAVILY_KEY:
-        try:
-            query = f"{district} mandi {state} today crop prices Agmarknet"
-            headers = {"Authorization": f"Bearer {TAVILY_KEY}", "Content-Type": "application/json"}
-            payload = {"query": query, "max_results": 3, "search_depth": "basic"}
-            
-            async with httpx.AsyncClient(timeout=10) as client:
-                res = await client.post(TAVILY_URL, headers=headers, json=payload)
-                if res.status_code == 200:
-                    results = res.json().get("results", [])
-                    if results:
-                        snippets = " ".join([r.get("content", "") for r in results])
-                        # AI से डेटा निकालवाएं
-                        system = "Extract up to 5 crop prices from this text. Reply ONLY in JSON array format: [{'crop':'Wheat', 'modal':2200}]. No other text."
-                        text = await groq_chat(system, snippets, max_tokens=300)
-                        
-                        # Parse AI response safely
-                        text = text.strip()
-                        if text.startswith("```"): text = text.split("```")[1]
-                        if text.startswith("json"): text = text[4:]
-                        first, last = text.find("["), text.rfind("]")
-                        if first >= 0 and last > first:
-                            extracted = json.loads(text[first:last+1])
-                            if extracted and len(extracted) > 0:
-                                items = [{"crop": e.get("crop", "फसल"), "variety": "सामान्य", "market": district, "date": "आज", "min": e.get("modal", 0)-100, "max": e.get("modal", 0)+100, "modal": e.get("modal", 0), "trend": "flat", "change": 0} for e in extracted]
-                                return {
-                                    "state": state, "district": district, "updated": "आज (वेब से)",
-                                    "source": "Live Web Data", "live": True, "items": items,
-                                }
-        except Exception as e:
-            print(f"Tavily Fallback Failed: {e}")
-
-    # 3. LAST RESORT: Hardcoded Sample (सिर्फ तब जब दोनों फेल हो जाएं)
+    # अगर कोई भी एरर आए, तो बिना ऐप को फ्रीज़ किए तुरंत सैंपल डेटा दें
     base = _sample_mandi(state, district)
-    base["district"] = f"{district} (सैंपल डेटा)"
-    base["source"] = "सरकारी सर्वर डाउन है, कृपया नज़दीकी मंडी में संपर्क करें"
+    base["source"] = "सैंपल डेटा (सर्वर व्यस्त है)"
     return base
-
 
 @app.post("/storage-advice")
 async def storage_advice(body: StorageQ):
